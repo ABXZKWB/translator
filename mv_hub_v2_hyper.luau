@@ -1,7 +1,356 @@
+-- ═══════════════════════════════════════════════════════════════════════
+-- 【最早期反作弊拦截】—— 必须放在整个脚本最前面
+--
+-- 游戏在三处用 getfenv 探测执行器（反编译确认）：
+--   InventoryController:461            → u0 = {}    模块表清空
+--   Shared.Raycast:260 / 310           → u115 = {}  射线模块表清空
+--   InventoryController:439 的 getCurrentEquipped → u192 变 nil
+--
+-- 脚本原先在文件末尾（第 13354 行）才调用 patchGetCurrentEquipped /
+-- patchRaycast，但前面一万多行里到处都在调 peekCurrentEquippedForMovement
+-- 和 Raycast.cast —— 只要有一次发生在补丁之前，反作弊就已经命中。
+-- 表现：不注入一切正常，一注入就买不了东西、物品栏 1234 消失、手上空气。
+--
+-- 这里在脚本最开头（任何 require 之前）就把两个入口换掉，掐断检测。
+-- ═══════════════════════════════════════════════════════════════════════
+
+-- ═══════════════════════════════════════════════════════════════════════
+-- Drawing 生命周期登记表（用它取代 cleardrawcache）
+--
+-- ⚠ cleardrawcache() 会把执行器的 Drawing 系统整个弄坏：对象还能 new、
+-- Visible 还是 true、代码全在跑，但底层渲染管线异常并持续拖慢客户端
+-- （potassium 被它用过两次后从 220 FPS 掉到 10~14，只能重进服务器）。
+--
+-- 所以改成自己记账：包一层 Drawing.new，把创建的每个对象登记进
+-- getgenv().MV_DRAW_REG（值弱引用，不会拖住 GC），卸载 / 重载时逐个
+-- :Remove()。效果等价于"清干净屏幕"，但完全不碰执行器内部状态。
+-- ═══════════════════════════════════════════════════════════════════════
+do
+    local reg = getgenv().MV_DRAW_REG
+    if type(reg) ~= "table" then
+        reg = setmetatable({}, { __mode = "v" })
+        getgenv().MV_DRAW_REG = reg
+    end
+    local okWrap = pcall(function()
+        local D = Drawing
+        if type(D) ~= "table" or type(D.new) ~= "function" or D._mv_reg then return false end
+        local origNew = D.new
+        D.new = function(kind)
+            local o = origNew(kind)
+            if o ~= nil then reg[#reg + 1] = o end
+            return o
+        end
+        if D.new == origNew then return false end   -- 只读，赋值没生效
+        D._mv_reg = true
+        return true
+    end)
+    getgenv().MV_DRAW_REG_OK = (okWrap == true)
+end
+
+-- 逐个销毁登记过的 Drawing（cleardrawcache 的安全替代）
+getgenv().MV_REAP_DRAWINGS = function()
+    local reg = getgenv().MV_DRAW_REG
+    if type(reg) ~= "table" then return 0 end
+    -- ⚠ 幂等保护：同一个对象只 Remove 一次。
+    --
+    -- 场景：fullCleanup 先调 clearEsp()/radarClear() 把一批对象 :Remove() 掉，
+    -- 随后又调本函数遍历登记表 —— 同一批对象会被 Remove 第二次。
+    -- 部分执行器的 Drawing:Remove() 不是幂等的，二次调用走的是已释放的 C 对象，
+    -- 这类 use-after-free 表现为**整个客户端进程直接消失**，控制台一条报错都没有。
+    -- 用一张弱键表记账，已经处理过（不论是谁处理的）就不再碰。
+    local dead = getgenv().MV_DRAW_DEAD
+    if type(dead) ~= "table" then
+        dead = setmetatable({}, { __mode = "k" })
+        getgenv().MV_DRAW_DEAD = dead
+    end
+    local n = 0
+    local skipped = 0
+    for i = #reg, 1, -1 do
+        local o = reg[i]
+        reg[i] = nil
+        if o ~= nil then
+            if dead[o] then
+                skipped += 1
+            else
+                dead[o] = true
+                pcall(function() o.Visible = false end)
+                local ok = pcall(function() o:Remove() end)
+                if not ok then pcall(function() o:Destroy() end) end
+                n = n + 1
+            end
+        end
+    end
+    getgenv().MV_REAP_LAST = string.format("removed=%d skipped=%d", n, skipped)
+    return n
+end
+
+-- ═══════════════════════════════════════════════════════════════════════
+-- wrapper → 原函数 的登记表
+--
+-- ⚠ Roblox/Luau 的 function **不能挂字段**：`f._mv_orig = x` 会直接抛
+-- "attempt to index function with '_mv_orig'"（实测踩到，整个脚本启动即死）。
+-- 但"这个函数到底是不是我们的 wrapper、它的原版是谁"必须能查，
+-- 否则重载会层层套 wrapper、卸载只还原最后一层。
+--
+-- 所以用一张弱键表记：MV_WRAP_ORIG[wrapper] = 真正的原版。
+-- 键弱引用 → wrapper 被游戏模块换掉后自然可回收，不会泄漏。
+-- ═══════════════════════════════════════════════════════════════════════
+do
+    local reg = getgenv().MV_WRAP_ORIG
+    if type(reg) ~= "table" then
+        reg = setmetatable({}, { __mode = "k" })
+        getgenv().MV_WRAP_ORIG = reg
+    end
+    getgenv().MV_MARK_WRAP = function(wrapper, orig)
+        if type(wrapper) == "function" and type(orig) == "function" then
+            reg[wrapper] = orig
+        end
+    end
+    -- 返回真正的原版；不是 wrapper 就返回 nil（调用方用 `or 自身` 兜底）
+    getgenv().MV_ORIG_OF = function(fn)
+        if type(fn) ~= "function" then return nil end
+        local o = reg[fn]
+        if type(o) == "function" and o ~= fn then return o end
+        return nil
+    end
+end
+
+do
+    local RS0 = game:GetService("ReplicatedStorage")
+    local HS0 = game:GetService("HttpService")
+    local PL0 = game:GetService("Players")
+
+    -- ═══ 装备状态契约（本文件唯一实现，S.patchGetCurrentEquipped 复用这一份）═══
+    --
+    -- 游戏里 getCurrentEquipped / peekCurrentEquippedForMovement 的返回契约是：
+    --     有装备 → 背包里的真实 item 对象（带 shoot / equip / unequip / reload / drop / scope 元表方法）
+    --     没装备 → nil
+    --
+    -- ⚠ 绝不能返回 JSON 解码表。JSON 表一个方法都没有，游戏拿它去调 :unequip() / :shoot()
+    -- 会直接抛错；而这个错发生在游戏自己的武器 / 输入处理链里，外部只能看到症状：
+    --     左键不开枪、右键不瞄准、按 1/2/3 切不了枪、快捷栏与真实装备脱节。
+    -- 这正是「物品栏看着有东西但切不了枪」和「买的东西不进包」的直接原因。
+    --
+    -- ⚠ 也绝不能调用原版函数取真实对象：原函数体内就是那段 getfenv 执行器检测，
+    -- pcall 只能接住错误、接不住副作用，每调一次 u192 就被清空一次。
+    local diag = { hit = 0, miss = 0, noAttr = 0, badJson = 0, last = "init" }
+    getgenv().MV_PEEK_DIAG = diag
+
+    local function findRealItem(ic, want)
+        if type(want) ~= "table" then return nil end
+        local wantId = want.Identifier
+        if wantId == nil then return nil end
+        local okInv, inv = pcall(function() return ic.getCurrentInventory() end)
+        if not okInv or type(inv) ~= "table" then return nil end
+        -- 槽位数按游戏实际（1 Primary / 2 Secondary / 3 Melee / 4 Grenade / 5 C4），
+        -- 这里放宽到 16，避免以后加槽位又漏匹配。
+        for si = 1, 16 do
+            local slot = inv[si]
+            if type(slot) == "table" and type(slot._items) == "table" then
+                for _, item in ipairs(slot._items) do
+                    if type(item) == "table" and item.Identifier == wantId then
+                        return item
+                    end
+                end
+            end
+        end
+        return nil
+    end
+
+    local function resolveEquipped(ic)
+        local lp0 = PL0.LocalPlayer
+        local raw = lp0 and lp0:GetAttribute("CurrentEquipped")
+        if type(raw) ~= "string" then
+            diag.noAttr += 1
+            diag.last = "no-attribute"
+            return nil
+        end
+        local okj, want = pcall(function() return HS0:JSONDecode(raw) end)
+        if not okj or type(want) ~= "table" then
+            diag.badJson += 1
+            diag.last = "bad-json"
+            return nil
+        end
+        local item = findRealItem(ic, want)
+        if item then
+            diag.hit += 1
+            diag.last = "real:" .. tostring(item.Name)
+            return item
+        end
+        -- 属性有值但背包里还没有同 Identifier 的对象：这是重生的同步窗口期。
+        -- 返回 nil（= 手上暂时没有东西）是唯一正确语义；返回 JSON 表会把游戏打崩。
+        diag.miss += 1
+        diag.last = "syncing:" .. tostring(want.Name)
+        return nil
+    end
+    getgenv().MV_RESOLVE_EQUIPPED = resolveEquipped
+
+    -- ① InventoryController：getCurrentEquipped + peekCurrentEquippedForMovement
+    local ok1, ic0 = pcall(function() return require(RS0.Controllers.InventoryController) end)
+    if ok1 and type(ic0) == "table" then
+        -- ⚠ 原引用只保存、绝不调用（内部就是那段 getfenv 检测）。
+        -- 幂等：重载脚本时 ic 表上挂的已经是上一实例的 wrapper，
+        -- 必须通过 MV_ORIG_OF 取到真正的原版，否则会把 wrapper 当原版存起来，
+        -- 卸载时"还原"回去的还是一层 wrapper。
+        local curPeek0 = ic0.peekCurrentEquippedForMovement
+        local curGCE0 = ic0.getCurrentEquipped
+        local origOf0 = getgenv().MV_ORIG_OF
+        if type(getgenv().MV_ORIG_PEEK) ~= "function" then
+            getgenv().MV_ORIG_PEEK = (origOf0 and origOf0(curPeek0)) or curPeek0
+        end
+        if type(getgenv().MV_ORIG_GCE) ~= "function" then
+            getgenv().MV_ORIG_GCE = (origOf0 and origOf0(curGCE0)) or curGCE0
+        end
+        -- ⚠ 绝对不能再调用原版 peek / getCurrentEquipped：pcall 接不住副作用，
+        -- 每调一次 u192 就被清空一次，背包和真实装备会永久脱节。
+        -- ⚠ 也绝不返回 JSON 解码表 —— 见上方契约说明，那是「左键不开枪」的直接原因。
+        local function gce()
+            -- ★★★ 2026-11-06 修复「一美化就坏」的根因 ★★★
+            --
+            -- 原版 getCurrentEquipped 在通过它那段 getfenv 检测之后，返回的就是
+            --     u192.CurrentEquipped
+            -- 而 peekCurrentEquippedForMovement 的实现是：
+            --     return u192 and u192.CurrentEquipped
+            -- 两者返回**同一个对象**，唯一区别是 peek 不扫调用栈、没有任何副作用。
+            -- 所以正确语义就是「直接转发给原版 peek」。
+            --
+            -- 之前这里只调 resolveEquipped(ic0)：它读的是
+            --     LocalPlayer:GetAttribute("CurrentEquipped")  那串 JSON
+            -- 而这个属性在重生 / 切枪 / 换回合 / 观战的窗口期经常是 nil
+            -- （实测 MV_PEEK_DIAG.noAttr = 852859），于是游戏拿到的永远是 nil ——
+            -- 它以为玩家手上没有武器，于是一路崩：
+            --   · viewmodel 建不出来           → 手持滚木、手部模型消失
+            --   · 背包物品创建链拿不到当前武器  → 快捷栏 1/2 被移除
+            --   · BuyMenuPurchase 走同一条内部链 → 有购买音效、钱不扣、东西不到手
+            -- 用户把这一整套现象当成了「美化触发反作弊」，实际是这次 patch 的语义错误。
+
+            -- ★acrepair 2026-11-06：若独立模块 ac_kill.luau 已注入，优先走它的实现。
+            -- MV_AC.peek 与下面这段语义完全一致（转发原版 peek + 属性反查兜底），
+            -- 但额外带「防写回自检」：游戏重新 require / 字段被外部重写时会自动重修，
+            -- 而本文件这份只是一次性 patch，失效了不会自己回来。
+            -- 两者共存时统一走它，避免两份 wrapper 各自记账、互相覆盖。
+            -- 注意：它返回 nil 也是有效语义（手上暂时没东西），必须直接 return，
+            -- 不能 fallthrough 到下面的属性反查，否则同一次调用会重复计一次 diag。
+            local acm = getgenv().MV_AC
+            if type(acm) == "table" and type(acm.peek) == "function" then
+                local okA, va = pcall(acm.peek)
+                if okA then return va end
+            end
+
+            local op = getgenv().MV_ORIG_PEEK
+            if type(op) == "function" and op ~= gce then
+                local okP, v = pcall(op)
+                if okP and v ~= nil then return v end
+            end
+            -- 兜底：原版 peek 也拿不到（u192 还没建立）时才用属性反查
+            return resolveEquipped(ic0)
+        end
+        getgenv().MV_MARK_WRAP(gce, getgenv().MV_ORIG_PEEK)
+        ic0.getCurrentEquipped = gce
+        ic0.peekCurrentEquippedForMovement = gce
+        getgenv().MV_GCE_PATCHED = true
+        warn("[ac-early] InventoryController 已接管（getCurrentEquipped + peek）")
+    end
+
+    -- ② Shared.Raycast：cast / castThrough（castThroughDistance 保持原版直通）
+    local ok2, rc0 = pcall(function() return require(RS0.Shared.Raycast) end)
+    if ok2 and type(rc0) == "table" and not getgenv().MV_RAYCAST_PATCHED then
+        -- ★acrepair 2026-11-06：取「真原版」而不是「字段上现在挂着的东西」。
+        -- 场景：ac_kill.luau 已经先注入过，rc0.cast / castThrough 上挂的已经是它的
+        -- wrapper。若直接把 rc0.cast 当原版存，卸载时「还原」回去的还是一层 wrapper。
+        -- MV_ORIG_OF（弱键表 wrapper → 原版）就是为这件事存在的。
+        local acOrigOf0 = getgenv().MV_ORIG_OF
+        local origCast0 = (acOrigOf0 and acOrigOf0(rc0.cast)) or rc0.cast
+        local origCastThrough0 = (acOrigOf0 and acOrigOf0(rc0.castThrough)) or rc0.castThrough
+        -- ★acrepair 2026-11-06：castThroughDistance 的原版单独留一份引用。
+        -- 反编译确认（Shared.Raycast:340）：它内部**没有任何 getfenv 检测**，
+        -- upvalue 只有 castThroughMaterials，所以本文件根本不该接管它 —— 只需直通。
+        local origCastDist0 = (acOrigOf0 and acOrigOf0(rc0.castThroughDistance)) or rc0.castThroughDistance
+
+        getgenv().MV_ORIG_CAST = origCast0
+        getgenv().MV_ORIG_CAST_THROUGH = origCastThrough0
+        getgenv().MV_ORIG_CAST_DIST = origCastDist0
+
+        -- 本文件自带的降级实现（ac_kill 未注入时用它）
+        local function myCast(origin, dir, params, filterList, filterFn)
+            local okc, res = pcall(function()
+                local p = params
+                if not p then
+                    p = RaycastParams.new()
+                    p.FilterType = Enum.RaycastFilterType.Exclude
+                    p.IgnoreWater = false
+                    p.CollisionGroup = "Bullet"
+                end
+                local fl = filterList
+                if type(fl) ~= "table" then fl = {} else
+                    local cp = {}
+                    for i, v in ipairs(fl) do cp[i] = v end
+                    fl = cp
+                end
+                p.FilterDescendantsInstances = fl
+                local pos = origin
+                local guard = 0
+                while guard < 32 do
+                    guard = guard + 1
+                    local r = workspace:Raycast(pos, dir, p)
+                    if not r then return { position = origin + dir } end
+                    local skip = false
+                    if type(filterFn) == "function" then
+                        local okf, sr = pcall(filterFn, r.Instance)
+                        skip = okf and sr == true
+                    end
+                    if not skip then
+                        return { instance = r.Instance, position = r.Position, normal = r.Normal, material = r.Material }
+                    end
+                    table.insert(fl, r.Instance)
+                    p.FilterDescendantsInstances = fl
+                end
+                return { position = origin + dir }
+            end)
+            if okc then return res end
+            local r2 = workspace:Raycast(origin, dir)
+            if r2 then return { instance = r2.Instance, position = r2.Position, normal = r2.Normal, material = r2.Material } end
+            return { position = origin + dir }
+        end
+
+        local function myCastThrough(origin, dir, maxDist, filterList)
+            return myCast(origin, dir, nil, filterList, nil)
+        end
+
+        -- ★acrepair 2026-11-06：优先用 ac_kill.luau 的实现。
+        -- 它的 cast 完整复刻了原版两条过滤分支（Shared.Raycast:81 isPartFiltered /
+        -- :88 isPartWhitelisted），而上面这份 myCast 只处理 filterFn，Exclude 模式下
+        -- 不做人物配件/碰撞胶囊/RootPart 过滤；它的 castThrough 则直接转发无检测的
+        -- castThroughDistance，语义与原版逐字一致。
+        -- 没有 ac_kill 时退回上面两份，保证单独注入主脚本也能跑。
+        local acm0 = getgenv().MV_AC
+        local castImpl = (type(acm0) == "table" and type(acm0.cast) == "function") and acm0.cast or myCast
+        local castThroughImpl = (type(acm0) == "table" and type(acm0.castThrough) == "function") and acm0.castThrough or myCastThrough
+
+        getgenv().MV_MARK_WRAP(castImpl, origCast0)
+        rc0.cast = castImpl
+        getgenv().MV_MARK_WRAP(castThroughImpl, origCastThrough0)
+        rc0.castThrough = castThroughImpl
+
+        -- ★acrepair 2026-11-06：castThroughDistance 恢复为直接转发原版。
+        -- 旧实现把它也裹成「壳调 rc0.cast」，两个后果：
+        --   ① 性能：原版一次 castThroughMaterials（最多 100 段 1000 stud 的 Raycast）
+        --      被拆成最多 32 次独立 workspace:Raycast；
+        --   ② 语义：丢掉穿透材质判定（checkMaterialDepth / u108 材质深度表 /
+        --      BreakableDoor / MaterialVariant / applyMapMinPenetration 的 Map 最小穿透），
+        --      「一次穿透距离查询」退化成「单次命中」，穿墙判定直接错。
+        -- 原版该函数无检测 → 直通原版是唯一正确做法。
+        rc0.castThroughDistance = origCastDist0
+
+        getgenv().MV_RAYCAST_PATCHED = true
+        warn("[ac-early] Raycast 已接管（cast / castThrough；castThroughDistance 直通原版）")
+    end
+end
+
 -- MovementV2 Hub 魔改版：hyperFire 默认开
 
 --[[
-    MovementV2 Hub  v2  ──  Maclib GUI
+MovementV2 Hub  v2  ──  WindUI GUI
     ─────────────────────────────────────────────────────────────
     修正 v1 的致命错误：
       · hook 一律使用 hookfunction 的**返回值**作为 original，杜绝递归
@@ -45,8 +394,11 @@ REG.gen = (REG.gen or 0) + 1
 local MY_GEN = REG.gen
 
 -- 清空上一实例的全部 Drawing（透视残留的真正来源）
+-- ⚠ 以前这里是一句 cleardrawcache()：它同时把执行器的 Drawing 系统打坏，
+-- 重载几次之后新实例画的线一条都不显示（对象存在、Visible=true、代码在跑）。
+-- 现在只销毁「我们自己登记过的」对象。
 pcall(function()
-    if cleardrawcache then cleardrawcache() end
+    if type(getgenv().MV_REAP_DRAWINGS) == "function" then getgenv().MV_REAP_DRAWINGS() end
 end)
 
 -- 回收上一实例的窗口 / 连接 / 绘制
@@ -118,12 +470,47 @@ do
             end
         end
     end
+
+    -- ★★★ 2026-11-06：重载时必须把上一实例的 WindUI / 图鉴面板彻底摘掉 ★★★
+    --
+    -- 实测：这个执行器里 `ScreenGui:Destroy()` 是**空操作**（pcall 返回 true、
+    -- 对象仍挂在父级下）。所以反复重载会累积出 3 套 WindUI + 22 个 MV_SkinPanel，
+    -- 屏幕上表现为「玩家列表重复好几份」「面板一层叠一层」。
+    -- Destroy 靠不住，改用「Enabled=false + Parent=nil」把旧 GUI 从整棵树上摘掉。
+    do
+        local okh2, holder2 = pcall(function()
+            if gethui then return gethui() end
+            return nil
+        end)
+        local lp2 = game:GetService("Players").LocalPlayer
+        local pg2 = lp2 and lp2:FindFirstChild("PlayerGui")
+        for _, h2 in ipairs({ (okh2 and holder2) or nil, pg2 }) do
+            if h2 then
+                local okc2, kids2 = pcall(function() return h2:GetChildren() end)
+                if okc2 and kids2 then
+                    for _, c2 in ipairs(kids2) do
+                        if c2:IsA("ScreenGui") then
+                            local nm2 = tostring(c2.Name)
+                            if string.find(nm2, "WindUI", 1, true)
+                                or string.find(nm2, "MV_SkinPanel", 1, true)
+                                or string.find(nm2, "MV_TestPanel", 1, true) then
+                                pcall(function()
+                                    c2.Enabled = false
+                                    c2.Parent = nil
+                                end)
+                            end
+                        end
+                    end
+                end
+            end
+        end
+    end
 end
 
 ---------------------------------------------------------------------
 -- 依赖
 ---------------------------------------------------------------------
-local MacLib = loadstring(game:HttpGet("https://github.com/biggaboy212/Maclib/releases/latest/download/maclib.txt"))()
+-- GUI 库改用 WindUI（见下方 GUI 段；MacLib 已整体移除）
 
 local Remotes = require(RS:WaitForChild("Database"):WaitForChild("Security"):WaitForChild("Remotes"))
 local shootPacket = Remotes.Inventory.ShootWeapon
@@ -151,7 +538,10 @@ local cfg = {
     aimTrigger = "hold",         -- hold（按住）| always（始终）| toggle（按键切换）
     aimToggled = false,          -- toggle 模式下的当前状态
     aimMode = "smooth",          -- "smooth"（转视角，安全）| "silent"（只改弹道，有风险）
-    fov = 250,
+    fov = 300,                   -- 瞄准范围圈半径（像素）；同时也是自瞄搜索半径
+                                 -- ⚠ 75 太小：目标只要离开准星 75 像素就出圈，
+                                 --   表现就是「6 连发里有的追踪、有的打墙」（实测 vDbg="fov d=488>250"）。
+                                 --   300 覆盖大半屏，静默/平滑都不再漏目标。
     -- 360° 静默：忽略「目标是否在画面内」，屏幕外、背后一律纳入候选。
     -- 静默只改子弹方向、不转视角，所以画面上看不看得见他并不影响能不能打中。
     -- 只保留「距离」和「视线通畅」两条限制。
@@ -159,7 +549,9 @@ local cfg = {
     -- ⚠ 默认改成 true。用户实测「6 连发里有的追踪、有的打墙」，诊断出来是
     --    vDbg = "fov d=488>250" —— 目标一移到屏幕边缘外 250px 就不锁了，
     --    那几发直接照准星方向飞。既然静默不依赖准星朝向，这个 FOV 限制本来就没必要。
-    fullSphere = true,
+    -- ⚠ 默认 false：true 时「360° 全向锁定」会隐藏 FOV 范围圈，
+    -- 用户每次重载后都会觉得「开了自瞄却没有圈」。想全向自己开。
+    fullSphere = false,
     showFov = true,
     fovColor = Color3.fromRGB(255, 255, 255),
     -- ⚠ 默认必须开。原来默认 false，配合「召唤 CT bot」会变成：
@@ -170,12 +562,14 @@ local cfg = {
     --    腿露在外面、头被栏杆/箱子挡住时会被误判成「看不见」，静默直接跳过那一发 ——
     --    用户看到的就是「高科技追踪子弹有一半不追踪」。
     --    需要严格遮挡判断的人可以手动打开。
-    aimVisibleCheck = false,
+    aimVisibleCheck = true,
     maxAimDist = 500,
     aimKeyHeld = false,          -- 已废弃，改用 aimInput.down
     -- 目标锁定
-    lockEnabled = true,
-    lockMaxSeconds = 6,
+    -- ⚠ 默认关闭：锁定会在解锁后每帧立刻重新锁回去，手动滑屏/移动鼠标完全拉不回来。
+    -- 想用就在「瞄准 → 锁定目标」里手动开。
+    lockEnabled = false,
+    lockMaxSeconds = 1.5,   -- 原来 6 秒，太长：目标都出圈了还被拉回去
     -- 目标优先级
     targetMode = "crosshair",     -- crosshair|nearest|farthest|lowesthp|highesthp|balanced|threat
     crosshairWeight = 1.0,        -- balanced 模式：屏幕距离权重
@@ -183,10 +577,10 @@ local cfg = {
     preferFacing = false,         -- 优先瞄正在看着你的人
     -- 人体化：让操作看起来像真人
     smoothness = 0.06,           -- 越大越慢越像人。0.22 明显跟不上移动目标，0.05~0.08 才跟手
-    jitter = 0.18,               -- 手抖强度（度，连续噪声）
+    jitter = 0.0,                -- 手抖强度（度）；0 = 完全不抖（默认关闭，开了会明显抖）
     reactionDelay = 0.14,        -- 发现目标后多久开始瞄（秒）
     headChance = 0.55,           -- 旧模式：瞄准头部的概率
-    aimHitPart = "auto",         -- 静默打哪个部位：auto / head / chest / stomach / legs
+    aimHitPart = "auto",         -- 静默打哪个部位：auto / head / chest / stomach / legs；auto 时交给下面的「露哪打哪」
     -- 自动重新装备：背包里有武器但手上是空的时主动 equip（默认开，修复"买不到/捡不到"）
     autoReequip = true,
     -- ── 自动拾取地上的武器：**恐怖分子 / 反恐精英各一套独立配置** ──
@@ -203,7 +597,7 @@ local cfg = {
     pickupStrat_CT = "value",
     pickupRange_CT = 6,
     pickupNamed_CT = "",
-    autoPickupEquip = true,       -- 两套共用：捡到后自动装备（AllowAutoEquip）
+    autoPickupEquip = false,      -- 两套共用：捡到后自动装备；默认关——换上的新枪 Identifier 服务端账本不认，会打出 0 伤害
     autoPickupInterval = 0.35,    -- 两套共用：扫描间隔（秒）；服务端限速 7/s
     -- ⚠ 换肤是否允许「本地改写 CurrentEquipped 属性」。
     -- 打开它会破坏背包同步（买东西不进、捡东西消失、主武器切不出来），
@@ -211,8 +605,8 @@ local cfg = {
     skinWriteAttr = false,
     -- 移动端：屏幕「开火」按钮按住时为 true（由按钮的 InputBegan/Ended 驱动）
     mobileHoldFire = false,
-    aimPartPriority = true,      -- 露哪打哪：头 > 脖子/胸 > 腹 > 手 > 腿 > 脚
-    overshoot = true,            -- 过冲再回拉
+    aimPartPriority = true,      -- 露哪打哪：头 > 脖子/胸 > 腹 > 手 > 腿 > 脚（头永远排第一）；aimHitPart 明确指定时以它为准
+    overshoot = false,           -- 过冲再回拉；默认关（开了镜头会先冲过头再拉回，看起来像抖）
     -- 暴力
     multiShot = false,
     -- 近战超距离倍数：把 MeleeAttack 的 Direction 长度和 Distance 一起放大。
@@ -226,9 +620,9 @@ local cfg = {
     -- 实测把发包间隔压到 0.05 秒的后果是整批包被丢弃，
     -- 连本来能打中的那一发也一起废掉（表现：开了它反而一发都不掉血）。
     -- 所以默认关；要开的话必须保证实际出手间隔 ≥ 武器 FireRate。
-    skipFireDelay = false,       -- 跳过开火间隔（本地解除冷却，不加快服务端射速）
+    skipFireDelay = true,        -- 跳过开火间隔；hyperFire 必须开，shoot() 要求 now-NextShotDue < 0.035
     bunnyhop = false,            -- 自动兔子跳（落地瞬间再跳，参考 CS）
-    wallbang = false,            -- 穿墙：把子弹起点搬到目标身前
+    wallbang = false,         -- 穿墙识别：能穿才锁（只看材质会放宽过头，实测开了反而打不出伤害；要开自己开）            -- 穿墙：把子弹起点搬到目标身前
     wallbangOffset = 3,          -- 起点距目标多远（stud）
     bulletTrack = false,         -- 子弹追踪：起点整个搬到目标身侧
     trackOffset = 2,             -- 追踪时起点距目标多远
@@ -238,13 +632,27 @@ local cfg = {
     mouseSmooth = 0.55,          -- 鼠标瞄准低通系数（越大越顺但越慢）
     mouseReleaseDelay = 0.6,     -- 真实键鼠操作后暂停鼠标瞄准多久
     nativeAimAssist = false,     -- 解锁游戏原生瞄准辅助（后坐力减半 + 磁性吸附）
-    autoFireMaxOffset = 45,      -- 自动开火：准星离目标多少像素内才允许开火
-    smoothAimHijack = false,     -- 平滑瞄准（接管游戏磁性吸附入口，真正转视角）
+    autoFireMaxOffset = 100,      -- 自动开火：准星离目标多少像素内才允许开火
+    smoothAimHijack = true,      -- 平滑瞄准（接管游戏磁性吸附入口，真正转视角）
+                                 -- ⚠ 默认 true：原来默认 false 且 installSmooth 只在 GUI toggle 里调用，
+                                 --   于是「注入脚本后自瞄完全没用」——用户必须手动去 GUI 点开关。
+                                 --   现在加载时自动装 hook（见文件末尾），开箱即用；不想用就在 GUI 关掉。
     smoothAimJitter = 0,         -- 平滑瞄准的抖动幅度（度）
-    smoothAimDrop = 0.9,         -- 平滑瞄准的瞄准点：从头部往下多少 stud（瞄胸口）
-    smoothAimSpeed = 0.12,       -- 平滑瞄准：每帧走剩余角度的比例（越小越慢越平滑）
-    smoothAimMaxDeg = 1.5,       -- 平滑瞄准：每帧最大转角（度），防止大角度硬切
-    smoothAimDeadzone = 0.3,     -- 平滑瞄准：死区（度），已经很接近就不再动
+    smoothAimDrop = 2.2,         -- 平滑瞄准的瞄准点：从 headPos 往下多少 stud
+                                 -- ⚠ 0.9 只到「肩膀上方」那块空气（实测 headPos.y=1004.81 - 0.9 = 1003.91，
+                                 --   而胸口 LowerTorso.y=1002.57）。2.2 精确落在胸口，误差 0.04 stud。
+    smoothAimSpeed = 0.18,       -- 平滑瞄准：每帧走剩余角度的比例（越小越慢越平滑）
+    smoothAimMaxDeg = 2.0,       -- 平滑瞄准：每帧最大转角（度）
+                                 -- ⚠ 这是「大角度救命值」：太小追不上（0.05 度/帧 = 180度要15秒，
+                                 --   表现就是「瞄空气」）；太大小角度会瞬吸。2.0 → 180度约0.44秒。
+    smoothAimDeadzone = 0.6,     -- 平滑瞄准：死区（度）
+                                 -- ⚠ 0.12 太窄会「抽风」：误差恰好卡在边界上，一会儿超死区动一下、
+                                 --   一会儿被吃掉归零，准星反复微抖（实测 pitch 在 -10.17↔-10.29 来回跳）。
+                                 --   0.6 度后实测 2.4 秒漂移 0.00 度。
+    aimPenetrateLayers = 1,      -- 视线检测最多穿透几层「透明物」
+                                 -- 1 = 和原版一样的射线次数，只多一个 Transparency 判断，零额外成本。
+                                 -- 只有「雪面 + 玻璃 + 铁丝网」叠在一起才需要 2~3。
+                                 -- 不做名字白名单：会随地图膨胀，且换图就失效。
     instantReload = false,       -- 瞬间换弹（跳过动画，弹匣一空立刻补满）
     espCoverTint = false,        -- 敌人高亮：暴露/掩体后用不同颜色
     colorExposed = Color3.fromRGB(255, 60, 60),    -- 暴露在外
@@ -258,24 +666,56 @@ local cfg = {
     infiniteAmmo = false,
     spinbot = false,
     spinSpeed = 360,
-    autoFire = false,
+    autoFire = true,              -- 默认开：每次重载重置成 false 太坑（用户反复遇到「自动开火没用」）
     autoFireDelay = 180,          -- 毫秒：锁定目标后等这么久才开火（模拟反应时间）
     -- 每种武器类型的自动开火参数
     weaponProfiles = {
         Rifle   = { enabled = true,  maxDist = 300 },
         Sniper  = { enabled = true,  maxDist = 900 },
-        Pistol  = { enabled = true,  maxDist = 150 },
+        Pistol  = { enabled = true, maxDist = 150 },   -- 默认关：手枪半自动会被自动开火打成连发
         SMG     = { enabled = true,  maxDist = 180 },
-        Shotgun = { enabled = true,  maxDist = 60  },
-        Melee   = { enabled = false, maxDist = 6   },
+        -- 霰弹枪：射程只有 120，超出基本零伤害。60 太短（贴脸都够不到），改 120。
+        Shotgun = { enabled = true,  maxDist = 120 },
+        Melee   = { enabled = true, maxDist = 6   },
+    },
+    -- 每把枪的「静默瞄准最大距离」。没列到的用 maxAimDist。
+    -- 霰弹枪必须短：远了子弹散到天上，锁了也是白开一枪。
+    aimDistByWeapon = {
+        ["Nova"] = 45, ["Sawed-Off"] = 45, ["MAG-7"] = 50, ["XM1014"] = 70,
+          ["Zeus x27"] = 13,   -- 跟游戏配置 Range=13.584 对齐（原来是 15，超出真实射程）
+          -- ⚠ 近战武器必须单独配：不配就会退回 maxAimDist（500），
+          -- 于是「拿着刀锁 500 stud 外的目标」，而刀实际只有 6 stud 射程 —— 锁了也打不到。
+          -- 用户反馈的「近战不会触发瞄准 / 电击枪锁远处」就是这个原因。
+          ["T Knife"] = 6, ["CT Knife"] = 6, ["Butterfly Knife"] = 6,
+          ["Bowie Knife"] = 6, ["Karambit"] = 6, ["Bayonet"] = 6,
+          ["M9 Bayonet"] = 6, ["Falchion Knife"] = 6, ["Huntsman Knife"] = 6,
+          ["Shadow Daggers"] = 6,
+        ["AWP"] = 900, ["SSG 08"] = 800,
+        ["Negev"] = 300,
+        ["MAC-10"] = 150, ["MP9"] = 150, ["P90"] = 180, ["UMP-45"] = 180,
+        ["Glock-18"] = 120, ["USP-S"] = 120, ["P250"] = 120, ["Five-SeveN"] = 130,
+        ["Desert Eagle"] = 200, ["R8 Revolver"] = 250, ["Tec-9"] = 150, ["Dual Berettas"] = 120,
+        ["AK-47"] = 400, ["M4A4"] = 400, ["M4A1-S"] = 350,
+        ["Galil AR"] = 300, ["FAMAS"] = 300, ["AUG"] = 350, ["SG 553"] = 400,
+        ["SCAR-20"] = 800, ["G3SG1"] = 800,
     },
     -- ESP
     esp = true,
     espBox = true,
-    espHealth = true,
+    espHealth = true,            -- 血条保留（信息量大、开销小）
     espName = true,
     espSkeleton = false,         -- 骨骼线（头-躯干-四肢）
     espHitbox = false,           -- 每个部位画碰撞框
+    -- ⚠ 以下三个是历史遗留字段，**没有任何代码读取它们**。
+    -- 实际生效的皮肤表是 S.skinPaint（元表自动落盘到 getgenv().MV_SKIN_SAVE）。
+    -- 留在这里只是因为旧存档里有这几个键（saveCfg 会回写），删掉会让老存档多出孤儿键。
+    skinAutoPaint = true,
+    skinAutoOpen = true,
+    skinAutoName = "Stock",
+    -- 性能：ESP 每 N 帧刷一次。手机默认 2（30Hz），PC 默认 1。
+    -- Drawing 的属性写入是跨 C++ 调用，每帧几十次是最贵的开销；降频视觉上几乎看不出来，
+    -- 但属性写入量直接砍半。功能一个不减，只是刷新率降下来。
+    espEveryNFrames = IS_MOBILE and 3 or 1,   -- 手机端 3 帧一次（10Hz @30fps）
     -- ⚠ 第三人称默认关闭，而且开着会导致「镜头被抢」。
     --
     -- 实测：开启时相机 yaw 每 0.15 秒跳 ±40 度、pitch 从 48 飙到 80；
@@ -287,8 +727,10 @@ local cfg = {
     thirdPerson = false,         -- 第三人称视角（会与游戏相机打架）
     thirdPersonDist = 12,        -- 第三人称最远距离
     espDist = true,
-    espWeapon = true,
-    espRange = 600,
+    autoFireWarmup = true,       -- 热身阶段是否也自动开火（默认 true = 保持历史行为；关掉则 Warmup 不按左键）
+
+    espWeapon = not IS_MOBILE,   -- 手机默认不画武器图标（每条要多一个 Drawing）
+    espRange = IS_MOBILE and 300 or 600,   -- 手机端缩到 300：远处目标不画，省 Drawing
     showTeammates = false,
     showBots = true,
     -- 尸体默认不画。
@@ -298,7 +740,10 @@ local cfg = {
     hideDead = true,
     -- 没有模型的目标不画（PVS 剔除 / 已离开 / 已死亡但服务端还在发 pose）。
     -- 关掉它就会看到停在旧位置的框，也就是「火柴人」。
-    hideNoModel = true,
+    -- ⚠ 默认 false：模型被 PVS 剔除的**活人**也要画框。
+    -- 设成 true 时，贴脸的敌人如果模型被剔除就完全不显示（自动开火照常，因为它只要位置），
+    -- 表现就是「人都贴脸了还没有框」。代价是尸体可能留一会儿残框（由 hideDead/ghostPurge 处理）。
+    hideNoModel = true,   -- 被 PVS 剔除的目标不画框（假框会骗自瞄；真正要修的是"看得见却没框"）
     -- 冻结目标（数据不更新）默认不画，避免残影
     hideFrozen = true,
     -- 目标从 ESP 消失后，Drawing 对象保留多久再彻底销毁（秒）。
@@ -352,7 +797,14 @@ local cfg = {
     noRecoil = false,
     -- 自动压枪：按百分比把弹簧当前后座反向补回相机
     autoRecoilComp = false,
-    recoilCompPercent = 100,   -- 100 = 完全压平，50 = 压一半
+    -- ⚠ 垂直（pitch）和水平（yaw）必须分开配：
+    --   垂直后坐力是**确定**的（每发都往上顶），可以压到 100%；
+    --   水平后坐力是**随机方向**的（每次左右不定），压到 100% 会把"随机"抹成"锁死"，
+    --   看起来反而不自然，而且会把准星从目标身上拽开。默认只压 60%。
+    -- 游戏自己的 RecoilAssist 也是分开的（ReductionAmount=0.5 / HorizontalReduction=0.85）。
+    recoilCompV = 100,        -- 垂直（pitch）压枪幅度 %
+    recoilCompH = 60,         -- 水平（yaw）压枪幅度 %
+    recoilCompPercent = 100,  -- 旧字段：V/H 都没配时才用它兜底（老存档兼容）
     -- 延迟补偿利用：把射击包的 ViewTick 往前/往后推（单位 tick，60tick≈1秒）
     -- 负数 = 回溯到更早（打敌人过去的位置），正数 = 推向未来
     viewTickOffset = 0,
@@ -391,10 +843,10 @@ local cfg = {
     --   rapidFire = 开一枪补发 N-1 次（burst，每次要点一下扳机）
     --   hyperFire = 按住就一直发，松开才停（真·连发武器的手感）
     -- 普通版保持 false；魔改版（mv_hub_v2_hyper.luau）默认 true。
-    hyperFire = true,
+    hyperFire = false,
     -- 连发间隔（秒）。0.02 = 50 发/秒。shoot() 内部要求
     -- (now - NextShotDue) < 0.035，所以 0.02 是安全下限附近，别低于 0.015。
-    hyperGap = 0.02,
+    hyperGap = 0.12,
     -- 无散射（据点/完美精准）：把 Bullets[].Direction 重置成相机准星方向，
     -- 抹掉游戏自己加的散射偏移（跑动/连射/跳跃造成的偏离全部消失）。
     -- 静默瞄准开启且锁定目标时会优先用静默的方向。
@@ -409,6 +861,9 @@ local cfg = {
     -- 屏幕边缘箭头：屏幕外的敌人也能指方向（弥补 2D 投影画不出背后的人）
     offscreen = true,
     offscreenRange = 600,
+    -- ⚠ 世界物品标注（地面武器/投掷物/下落物）：默认关闭。
+    -- 原来没有默认值 → nil → drawWorldItems 里 `== false` 判断失效 → 每 0.12 秒空跑一轮。
+    showWorldItems = false,
     -- 投掷物信息
     showGrenadeInfo = true,
     showVfxZones = true,         -- 显示烟/火的真实覆盖区域
@@ -445,7 +900,8 @@ local cfg = {
     grenadeDiag = false,
     markThreat = true,
     -- 烟雾
-    aimThroughSmoke = true,      -- 烟后的人是否还锁（子弹能穿烟，所以默认允许）
+    -- ⚠ 默认改成 false：子弹能穿烟不等于「看不看得见」，烟里的人锁了就是瞎打。
+    aimThroughSmoke = false,
     markSmoke = true,            -- ESP 上标记"在烟后"的人
     -- 烟雾遮挡判定阈值：烟雾展开程度要超过这个值才算「真的挡住了」。
     -- 0.6 = 展开 60% 以上。调低更保守（烟还没起来就判定挡住），
@@ -481,6 +937,19 @@ local cfg = {
 -- 而主 chunk 已经贴着 200 上限（超了就是 "Out of local registers ... exceeded limit 200"，
 -- 且 loadstring 只会返回 nil，看起来像「改动没生效」，实际整份脚本都没跑起来）。
 -- 所以是 do + 立即执行函数两层：local 在函数里，语句边界靠 do 划定。
+-- ⚠ 出厂值必须在「存档恢复」之前快照。
+-- 原来的顺序是：先把 MV_CFG_SAVE 覆盖进 cfg，再 deepcopy(cfg) 当 CFG_DEFAULTS ——
+-- 那份"默认值"里已经有上次的存档了。于是「恢复默认配置」按钮点下去恢复的是
+-- **上次的配置**，等于按钮无效。
+do
+    local function deepcopy(x)
+        if type(x) ~= "table" then return x end
+        local o = {}
+        for k, v in pairs(x) do o[k] = deepcopy(v) end
+        return o
+    end
+    getgenv().__MV_CFG_FACTORY = deepcopy(cfg)
+end
 do
     (function()
         local saved = getgenv().MV_CFG_SAVE
@@ -512,16 +981,36 @@ do
             -- （实测：改了 cfg 默认值、重载后读出来还是 false，就是这条）。
             saved.showBounceDots = nil
         end
+        if ver < 6 then
+            -- v5 → v6 的历史迁移（保留 id，不再做 showSites 相关处理）
+        end
+        if ver < 7 then
+            -- v6 → v7：把 showSites 强制拉回代码默认值（true）。
+            -- v6 那版曾经把默认改成 false 并把 false 写进了存档；
+            -- 现在恢复成默认开，必须清掉存档里的 false，否则还是显示不出来。
+            saved.showSites = nil
+        end
         if ver < 5 then
             getgenv().MV_CFG_MIGRATED = string.format("%d -> 5", ver)
         end
         local restored = 0
         for k, v in pairs(saved) do
             local cur = cfg[k]
-            if cur ~= nil and type(cur) == type(v)
-                and (type(v) == "boolean" or type(v) == "number" or type(v) == "string") then
-                cfg[k] = v
-                restored += 1
+            if cur ~= nil then
+                -- 标量：类型必须一致（防止旧存档把 number 塞进 boolean 字段）
+                if (type(v) == "boolean" or type(v) == "number" or type(v) == "string")
+                    and type(cur) == type(v) then
+                    cfg[k] = v
+                    restored += 1
+                -- Color3：saveCfg 里编码成 {__t="Color3", r,g,b}
+                elseif type(v) == "table" and v.__t == "Color3" and typeof(cur) == "Color3" then
+                    local okc, col = pcall(function() return Color3.new(v.r, v.g, v.b) end)
+                    if okc then cfg[k] = col; restored += 1 end
+                -- EnumItem：{__t="Enum", e="KeyCode", n="RightControl"}
+                elseif type(v) == "table" and v.__t == "Enum" and typeof(cur) == "EnumItem" then
+                    local okE, item = pcall(function() return Enum[v.e][v.n] end)
+                    if okE and item ~= nil then cfg[k] = item; restored += 1 end
+                end
             end
         end
         getgenv().MV_CFG_RESTORED = restored
@@ -529,15 +1018,22 @@ do
 end
 
 -- 把当前配置写回 getgenv，供下次加载恢复
+-- ⚠ 以前只存 boolean/number/string，于是 Color3（抛物线颜色、框颜色…）、
+-- EnumItem（菜单开关键）每次重载都回默认值 —— 用户以为"改了没保存"。
+-- 现在把这两类编码成带标记的小表一起存。
 local function saveCfg()
     local out = {}
     for k, v in pairs(cfg) do
         local t = type(v)
         if t == "boolean" or t == "number" or t == "string" then
             out[k] = v
+        elseif typeof(v) == "Color3" then
+            out[k] = { __t = "Color3", r = v.R, g = v.G, b = v.B }
+        elseif typeof(v) == "EnumItem" then
+            out[k] = { __t = "Enum", e = tostring(v.EnumType), n = v.Name }
         end
     end
-    out.__v = 5
+    out.__v = 7
     getgenv().MV_CFG_SAVE = out
 end
 saveCfg()
@@ -551,32 +1047,133 @@ local S = {
     conns = {},
     frameHook = nil,
     ammoAttrBackup = nil,
+    -- 本实例是否还应当继续工作。
+    --
+    -- ⚠ 所有常驻循环以前只看 REG.gen：那个判据只能覆盖「重载」（新实例把 gen 加一），
+    -- 覆盖不了「单独卸载」—— 直接调 Window:Unload() / WindUI:Destroy() 时 gen 不变，
+    -- 皮肤轮询、世界物品循环、刷新列表这些 while true 会一直跑到下次重载，
+    -- 拿着已经销毁的 GUI 对象继续干活（CPU 白烧 + 日志刷屏 + 偶发报错）。
+    -- fullCleanup 第一件事就是把它置 false，所有循环同时看这个标志。
+    _alive = true,
 }
+
+-- ═══ 默认配置基线（换 GUI 库后保留老 UI 那套默认值）═══
+-- 用「存档恢复之前」拍下的快照；没有快照才退回当前 cfg（第一次加载）。
+do
+    S.CFG_DEFAULTS = getgenv().__MV_CFG_FACTORY
+    getgenv().__MV_CFG_FACTORY = nil
+    if type(S.CFG_DEFAULTS) ~= "table" then
+        local function deepcopy(x)
+            if type(x) ~= "table" then return x end
+            local o = {}
+            for k, v in pairs(x) do o[k] = deepcopy(v) end
+            return o
+        end
+        S.CFG_DEFAULTS = deepcopy(cfg)
+    end
+end
+
+-- ═══ 找菜单主 ScreenGui（唯一权威实现）═══
+--
+-- ⚠ 不能再用「ScreenGui 下面挂着叫 Base 的 Frame」当判据：
+-- WindUI 的实际结构是 gethui()/WindUI（DisplayOrder = -99999）
+--   → Window(Folder) → Frame，根节点上**没有** Base。
+-- 用 Base 找的结果是 S.menuScreenGui 永远是 nil，连带两件事一起坏：
+--   ① GetState 拿不到真实 Enabled，只能退回 WindUI 的 Closed 字段；
+--   ② 商店打开时「自动收起菜单」那段 `if not sg then return end` 直接跳过，
+--      菜单就永远盖在商店上面 —— 用户看到的是「商店点不动」。
+S.findMenuGui = function()
+    local roots = {}
+    local okh, h = pcall(function() return gethui and gethui() end)
+    if okh and h then roots[#roots + 1] = h end
+    roots[#roots + 1] = game:GetService("CoreGui")
+    local legacy = nil
+    for _, rt in ipairs(roots) do
+        local okd, descs = pcall(function() return rt:GetDescendants() end)
+        if okd and descs then
+            for _, d in ipairs(descs) do
+                if d:IsA("ScreenGui") then
+                    local nm = tostring(d.Name)
+                    -- WindUI 主容器：名字精确等于 WindUI（通知/下拉/提示是 WindUI/xxx）
+                    if nm == "WindUI" then return d end
+                    -- 兼容旧版 GUI 库：ScreenGui 上挂 Base Frame
+                    if legacy == nil and d:FindFirstChild("Base") then legacy = d end
+                end
+            end
+        end
+    end
+    return legacy
+end
+
+-- 把 cfg 重置为出厂值，并尽量把 UI 控件同步过来（读不到的类型就跳过）
+S.resetConfig = function()
+    local d = S.CFG_DEFAULTS
+    if type(d) ~= "table" then return false, "没有默认值基线" end
+    local nTbl = 0
+    for k, v in pairs(d) do
+        if type(v) == "table" then
+            -- ⚠ 表配置以前被整段跳过（weaponProfiles / aimDistByWeapon …），
+            -- 于是「恢复默认」只恢复了一半。这里做两层深拷贝，
+            -- 不能直接赋引用，否则后续修改会污染基线、下次恢复就带脏数据。
+            local copy = {}
+            for kk, vv in pairs(v) do
+                if type(vv) == "table" then
+                    local inner = {}
+                    for k3, v3 in pairs(vv) do inner[k3] = v3 end
+                    copy[kk] = inner
+                else
+                    copy[kk] = vv
+                end
+            end
+            cfg[k] = copy
+            nTbl += 1
+        else
+            cfg[k] = v
+        end
+    end
+    -- UI 同步：S.UI 的 key 是**控件 ID**（AutoFire / SkinSlot1 …），不是 cfg 字段名，
+    -- 两者没有可靠映射，硬对着改只会把无关控件设成错误值。
+    -- 所以这里只恢复 cfg，界面在重开菜单/重载后自然同步。
+    return true, string.format("已恢复出厂配置（含 %d 个表配置）；界面显示需重开菜单或重载后同步", nTbl)
+end
 local function myTeam() return tostring(LP:GetAttribute("Team")) end
 local function charsFolder() return workspace:FindFirstChild("Characters") end
 local function culledFolder() return RS:FindFirstChild("_PVS_CulledCharacters") end
 
 -- 全量角色来源：可见角色 + 被 PVS 剔除的角色（后者在 ReplicatedStorage 里）
 --
--- ⚠⚠⚠ 必须递归下钻一层：workspace.Characters 的直接子项是**按阵营分的 Folder**
---     Characters/
---       Terrorists/            ← Folder
---         <玩家名>/            ← 真正的 Model
---       Counter-Terrorists/    ← Folder
---         <玩家名>/
--- 旧代码 `for _, m in ipairs(folder:GetChildren()) do if m:IsA("Model")` 只看直接子项，
--- 拿到的是 Folder，IsA("Model") 恒为 false —— allCharModels() **一直返回空表**，
--- myModel() 也永远找不到自己。
--- 后果：骨骼 / 碰撞箱 / 头部精确坐标这些「模型数据源」全是空的，透视只能靠
--- RemoteBuffer 的 pose 兜底，而 pose 对不可见玩家是冻结的 ——
--- 这正是「开局一瞬间对、之后位置就错」和「框在原地不动」的真正原因。
+-- ⚠⚠⚠ 本作的真实结构和旧注释假设的完全不同（2026-11-05 实测）：
+--
+--     workspace.Characters/
+--         Terrorists/              ← 空
+--         Counter-Terrorists/      ← 空
+--         Hostages/                ← 空
+--         FTbh_5019/               ← ★ 玩家名做文件夹，**这个 Folder 本身就是角色**
+--             Head [Part]
+--             UpperTorso / LowerTorso / HumanoidRootPart / CameraPart …
+--             CharacterArmor/      ← 只是装甲装饰件
+--             WeaponModel/ WeaponAttachments/
+--         BKLE999/                 ← AI，结构同上，另有 Highlight
+--
+-- 三个致命差异：
+--   ① 角色是 **Folder** 不是 Model —— 只判 `IsA("Model")` 会全部漏掉
+--   ② 没有 Humanoid，按 Humanoid 找血量的代码全部拿不到
+--   ③ 不按阵营分文件夹，阵营要从「文件夹名是不是某个 Player」去反查
+-- 这正是「AI 站在面前也不锁定」的直接原因：候选列表一直是空的。
 local function allCharModels()
     local list, seen = {}, {}
     local function takeModel(m)
-        if m:IsA("Model") and not seen[m.Name] then
-            seen[m.Name] = true
+        local key = tostring(m.Name)
+        if not seen[key] then
+            seen[key] = true
             table.insert(list, m)
         end
+    end
+    local function looksLikeChar(f)
+        return f:FindFirstChild("Head") ~= nil
+            or f:FindFirstChild("UpperTorso") ~= nil
+            or f:FindFirstChild("LowerTorso") ~= nil
+            or f:FindFirstChild("HumanoidRootPart") ~= nil
     end
     local function take(folder)
         if not folder then return end
@@ -584,9 +1181,16 @@ local function allCharModels()
             if m:IsA("Model") then
                 takeModel(m)
             elseif m:IsA("Folder") or m:IsA("Configuration") then
-                -- 阵营层：往下再取一层模型
+                local gotModel = false
                 for _, mm in ipairs(m:GetChildren()) do
-                    if mm:IsA("Model") then takeModel(mm) end
+                    if mm:IsA("Model") then
+                        takeModel(mm)
+                        gotModel = true
+                    end
+                end
+                -- 阵营层下面是空的 → 这个 Folder 自己就是角色
+                if not gotModel and looksLikeChar(m) then
+                    takeModel(m)
                 end
             end
         end
@@ -601,13 +1205,17 @@ local function culledCount()
     return f and #f:GetChildren() or 0
 end
 local function myModel()
-    -- ⚠ 同样要下钻阵营层：FindFirstChild(LP.Name) 在 Characters 根下找不到
-    -- （自己的模型在 Characters.Terrorists.<名字>）。之前这里恒为 nil，
-    -- myRoot() 跟着恒为 nil → 投掷起点、位置外推、近战判定全都拿不到自身坐标。
     local f = charsFolder()
     if not f then return nil end
+    -- 情况 B（本作实际结构）：Characters/<玩家名> 直接是角色
     local direct = f:FindFirstChild(LP.Name)
-    if direct and direct:IsA("Model") then return direct end
+    if direct then
+        if direct:IsA("Model") then return direct end
+        if direct:FindFirstChild("Head") or direct:FindFirstChild("HumanoidRootPart") then
+            return direct
+        end
+    end
+    -- 情况 A（旧结构）：Characters/<阵营>/<玩家名>
     for _, team in ipairs(f:GetChildren()) do
         if team:IsA("Folder") or team:IsA("Configuration") then
             local m = team:FindFirstChild(LP.Name)
@@ -1504,7 +2112,10 @@ end)
 
 -- 瞄准是否生效：总开关 + 触发方式
 local function aimActive()
-    if not cfg.silentAim then return false end
+    -- ⚠ 总开关只该管「静默」。原来这里第一行就 `if not cfg.silentAim then return false end`，
+    -- 导致想只用平滑的人一关总开关，平滑也跟着死（user 反馈「普通平滑自瞄没用」）。
+    -- 现在：silent 模式才受 silentAim 约束；smooth / mouse 只看触发方式。
+    if (cfg.aimMode or "smooth") == "silent" and not cfg.silentAim then return false end
     local trig = cfg.aimTrigger or "hold"
     if trig == "always" then return true end
     if trig == "toggle" then return cfg.aimToggled == true end
@@ -1516,6 +2127,9 @@ end
 local aimLock = { name = nil, at = 0 }
 
 local function breakAimLock()
+    -- ⚠ 解锁后必须冷静一会儿：aimTarget() 每帧都会重新锁定，
+    -- 不加冷却的话手滑/移动鼠标只能解锁一帧（16ms），看起来就是「拉不回来」。
+    S._unlockUntil = os.clock() + 0.7
     aimLock.name = nil
     aimLock.at = 0
 end
@@ -1572,8 +2186,11 @@ end
 local function scoreFor(t, screenDist)
     local mode = cfg.targetMode or "crosshair"
 
-    -- 威胁优先：正对我的人先打，其次按屏幕距离
-    if cfg.preferFacing and facingMe(t) then
+    -- ⚠ 「正对我的人优先」只在 crosshair 模式下生效。
+    -- 之前它无条件 return -1000 + …，把后面所有模式（nearest/farthest/lowesthp…）全劫持了：
+    -- 用户选「最近」，实际永远优先打「正对着我」的人 —— 360° 时背后正对你的人也算，
+    -- 于是出现「选最近却打背后」。
+    if mode == "crosshair" and cfg.preferFacing and facingMe(t) then
         return -1000 + screenDist * 0.01
     end
 
@@ -1648,6 +2265,42 @@ local function aimTarget()
     -- 前面全部丢失，等于没用。现在挂在 S.vFail 上持续累加，
     -- 想看某一段就先把 S.vFail = {} 清零。
     if type(S.vFail) ~= "table" then S.vFail = {} end
+    -- ═══ 穿墙识别：能不能穿，按游戏自己的材质/武器规则算 ═══
+    --
+    -- 情报里的判定公式（Shared.Raycast:138）：
+    --   v1[v2] = 累计厚度;  v5 = 材质允许穿透值;  if v5 + 武器预算 < 厚度 then 打不穿
+    -- 材质穿透值：Concrete 0 / Wood 10 / Plastic 10 / Glass 25 / Fabric 25
+    -- 武器 Penetration：AWP·SSG 0.90 / 步枪 0.65 / 手枪 0.14 / P90·MP9·霰弹 0
+    --
+    -- 这里把它简化成「等级比较」：材质要几级穿透、手里的枪给到几级。
+    -- 步枪能穿木/塑料/玻璃，AWP 连混凝土也穿，手枪只穿玻璃/布，SMG 一律不穿。
+    S.PIERCE_MAX_GAP = 8   -- 墙后最多几 stud 才允许穿（越大越容易打空）
+    S.MAT_PIERCE = {
+        Concrete = 3, Brick = 3, Metal = 3, CorrodedMetal = 3, DiamondPlate = 3,
+        Wood = 2, WoodPlanks = 2, Plastic = 2, SmoothPlastic = 2, Cobblestone = 2,
+        Pebble = 2, Rock = 3,
+        Glass = 1, Fabric = 1, ForceField = 1, Foil = 1, Grass = 1, Sand = 1,
+    }
+
+    S.weaponPierceLevel = function()
+        local ic = getInvCtrl()
+        local w = ic and ic.peekCurrentEquippedForMovement()
+        local P = w and w.Properties
+        local pen = tonumber(P and P.Penetration) or 0
+        if pen >= 0.85 then return 3, pen end
+        if pen >= 0.60 then return 2, pen end
+        if pen > 0 then return 1, pen end
+        return 0, pen
+    end
+
+    -- 返回 (能穿?, 材质等级, 武器等级)
+    S.canPierce = function(hit)
+        local lvl = S.weaponPierceLevel()
+        local mat = (hit and hit.Material and hit.Material.Name) or "?"
+        local need = S.MAT_PIERCE[mat] or 3   -- 未知材质按最硬的算，保守
+        return (lvl > 0 and need <= lvl), need, lvl
+    end
+
     local vFailCounts = S.vFail
     local function vFail(kind, detail)
         S.vDbg = detail or kind
@@ -1656,6 +2309,23 @@ local function aimTarget()
     end
 
     local function viable(t)
+        -- ⚠ 被闪光晃到时不该锁人：这个服的白屏用 Lighting.ColorCorrection.Brightness 实现，
+        -- 被闪时从 0 飙到 1 左右。以前所有自瞄（平滑/鼠标/静默/自动开火）都没有这一条，
+        -- 所以「被闪了照样锁头开枪」。放在 viable() 入口 = 所有模式统一生效。
+        do
+            -- ⚠ 游戏闪光用独立对象（反编译自 VFXLibary.FlashEffect）：
+            --   ScreenGui "FlashbangEffect"（PlayerGui 下，DisplayOrder 999）
+            --   ColorCorrectionEffect "FlashbangColorCorrection"（Lighting 下）
+            -- 之前查的 Lighting.ColorCorrection 是游戏基础校正，Brightness 恒为 0 → 永远检测不到。
+            local pgV = game.Players.LocalPlayer:FindFirstChild("PlayerGui")
+            if pgV and pgV:FindFirstChild("FlashbangEffect") then
+                return vFail("flash", "flashbang-effect")
+            end
+            local ccV = game:GetService("Lighting"):FindFirstChild("FlashbangColorCorrection")
+            if ccV and ccV:IsA("ColorCorrectionEffect") and (tonumber(ccV.Brightness) or 0) > 0.1 then
+                return vFail("flash", "flashbang-cc brightness=" .. string.format("%.2f", ccV.Brightness))
+            end
+        end
         if t.dead then return vFail("dead", "dead:" .. tostring(t.name)) end
         if cfg.teamCheck and t.sameTeam then
             return vFail("teammate", "teammate:" .. tostring(t.name))
@@ -1669,7 +2339,11 @@ local function aimTarget()
         if t.frozen then return vFail("frozen", "frozen:" .. tostring(t.name)) end
         local sp = cam:WorldToViewportPoint(t.headPos)
         local d = 0
-        if cfg.fullSphere ~= true then
+        -- ⚠ 360° 全向锁定只对「静默」有意义（改弹道、不转视角）。平滑/鼠标要靠转视角，
+        -- 锁屏幕外的人根本转不过去。以前这里只看 cfg.fullSphere、不分模式，
+        -- 结果「选了平滑却把准星拽向背后」。
+        local useSphere = (cfg.fullSphere == true) and ((cfg.aimMode or "smooth") == "silent")
+        if not useSphere then
             if sp.Z <= 0 then return vFail("zneg", "z=" .. string.format("%.1f", sp.Z)) end
             d = (Vector2.new(sp.X, sp.Y) - center).Magnitude
             if d > cfg.fov then
@@ -1679,10 +2353,54 @@ local function aimTarget()
             d = 0
         end
         if cfg.aimVisibleCheck then
-            local dir = t.headPos - cam.CFrame.Position
-            local hit = workspace:Raycast(cam.CFrame.Position, dir, visParams)
-            if hit and (t.headPos - hit.Position).Magnitude >= 1.5 then
-                return vFail("blocked", "blocked by " .. tostring(hit.Instance and hit.Instance.Name))
+            -- ⚠ 露哪打哪（aimPartPriority）时，不能用「头部射线」判可见性。
+            -- 原来这里写死 t.headPos：目标只露一条手臂、头在墙后 → 直接 blocked 判死，
+            -- 后面的 bestVisiblePart / AIM_PART_ORDER 根本没机会跑（用户实测：露手臂不打）。
+            -- 现在先按部位列表逐个试，只要有任何部位到相机之间没有地图遮挡就放行。
+            if cfg.aimPartPriority and t.model then
+                local PART_NAMES = {
+                    "Head", "UpperTorso", "LowerTorso",
+                    "RightUpperArm", "LeftUpperArm", "RightLowerArm", "LeftLowerArm",
+                    "RightHand", "LeftHand",
+                    "RightUpperLeg", "LeftUpperLeg", "RightLowerLeg", "LeftLowerLeg",
+                    "RightFoot", "LeftFoot",
+                }
+                local anyVisible = false
+                for _, nm in ipairs(PART_NAMES) do
+                    local part = t.model:FindFirstChild(nm)
+                    if part and part:IsA("BasePart") then
+                        local delta = part.Position - cam.CFrame.Position
+                        if delta.Magnitude < 300 then
+                            if not workspace:Raycast(cam.CFrame.Position, delta, visParams) then
+                                anyVisible = true
+                                S.visPart = nm
+                                break
+                            end
+                        end
+                    end
+                end
+                if not anyVisible then
+                    return vFail("blocked", "no-visible-part:" .. tostring(t.name))
+                end
+            else
+                local dir = t.headPos - cam.CFrame.Position
+                local hit = workspace:Raycast(cam.CFrame.Position, dir, visParams)
+                if hit and (t.headPos - hit.Position).Magnitude >= 1.5 then
+                    -- 墙后：材质等级够 且 目标离墙不超过 PIERCE_MAX_GAP 才放行
+                    local gap = (t.headPos - hit.Position).Magnitude
+                    local canPen, need, lvl = false, 3, 0
+                    if cfg.wallbang then
+                        canPen, need, lvl = S.canPierce(hit)
+                    end
+                    if canPen and gap <= (S.PIERCE_MAX_GAP or 8) then
+                        S.pierceOk = (S.pierceOk or 0) + 1
+                        S.lastPierce = string.format("%s need=%d lvl=%d gap=%.1f", tostring(hit.Material), need, lvl, gap)
+                    else
+                        S.pierceNo = (S.pierceNo or 0) + 1
+                        S.lastPierce = string.format("blocked %s need=%d lvl=%d gap=%.1f", tostring(hit.Material), need, lvl, gap)
+                        return vFail("blocked", "blocked by " .. tostring(hit.Instance and hit.Instance.Name))
+                    end
+                end
             end
         end
         if not cfg.aimThroughSmoke then
@@ -1694,9 +2412,24 @@ local function aimTarget()
         return true, d
     end
 
+    -- ⚠ 每把枪一个瞄准距离：霰弹枪 45、AWP 900、AK 400…
+    -- 原来只有全局 cfg.maxAimDist=500，霰弹枪会在 200 stud 外锁人（射程只有 120，等于空放）。
+    local aimMax = cfg.maxAimDist
+    do
+        local okw, w = pcall(function()
+            local ic = getInvCtrl()
+            return ic and ic.peekCurrentEquippedForMovement()
+        end)
+        if okw and w and w.Name and cfg.aimDistByWeapon then
+            local d = cfg.aimDistByWeapon[tostring(w.Name)]
+            if d then aimMax = d end
+        end
+    end
+    S.aimMaxNow = aimMax
+
     local candidates = {}
     for _, t in ipairs(allTargets()) do
-        if t.distance <= cfg.maxAimDist then
+        if t.distance <= aimMax then
             if not (cfg.teamCheck and t.sameTeam) then
                 candidates[#candidates + 1] = t
             end
@@ -1729,7 +2462,7 @@ local function aimTarget()
         end
     end
 
-    if best and cfg.lockEnabled then
+    if best and cfg.lockEnabled and not (S._unlockUntil and os.clock() < S._unlockUntil) then
         aimLock.name = best.name
         aimLock.at = os.clock()
     end
@@ -1933,7 +2666,10 @@ end
 local function bestVisiblePartCached(t)
     local now = os.clock()
     local c = partVisCache[t.name]
-    if c and now - c.at < 0.15 then return c.pos, c.part end
+    -- ⚠ 缓存从 0.15 缩到 0.05（3 帧）。
+    -- 0.15 秒的后果：露头 → 打头，头缩回去之后还会继续打头 150ms（等于往墙上打）。
+    -- 用户的预期是「露头优先打头，缩回去立刻换下一个部位」。
+    if c and now - c.at < 0.05 then return c.pos, c.part end
     local pos, part = bestVisiblePart(t)
     partVisCache[t.name] = { pos = pos, part = part, at = now }
     return pos, part
@@ -1979,7 +2715,20 @@ local function aimPointFor(t)
 end
 
 local function updateSmoothAim(dt)
-    if not (cfg.aimMode == "smooth" and aimActive()) then
+    -- ⚠ 两条平滑链路必须互斥，否则同一个目标被转两次：
+    --   · cfg.smoothAimHijack == true → AASYS.installSmooth 接管 GetMagnetismRotation，
+    --     由游戏的相机控制器每帧转 ≤smoothAimMaxDeg 度；
+    --   · 这里（updateSmoothAim）走 mousemoverel / cam.CFrame。
+    -- 两个一起开就是「相机 1.5°/帧 + 鼠标增量」叠加 —— 过冲、来回抖、目标附近不收敛。
+    -- 所以磁性吸附接管开着时，这里直接让位。
+    if cfg.smoothAimHijack == true then
+        resetHuman()
+        return
+    end
+    -- ⚠ 全文件其它地方都写 (cfg.aimMode or "smooth")，只有这里裸比较。
+    -- 一旦 aimMode 变成 nil（旧存档 / 被外部清过），平滑瞄准会永久不进入，
+    -- 而 UI 上还显示着「平滑」—— 用户看到的就是「自瞄选了平滑但完全没反应」。
+    if not (((cfg.aimMode or "smooth") == "smooth") and aimActive()) then
         resetHuman()
         return
     end
@@ -2003,7 +2752,9 @@ local function updateSmoothAim(dt)
     end
 
     local cam = workspace.CurrentCamera
+    if not cam then return end
     local aimPos = aimPointFor(t)
+    if typeof(aimPos) ~= "Vector3" then return end
 
     -- 过冲：短时间内把瞄准点往目标外侧偏一点，再由平滑拉回
     if cfg.overshoot and os.clock() < human.overshootUntil then
@@ -2011,29 +2762,72 @@ local function updateSmoothAim(dt)
         aimPos = aimPos + Vector3.new(-off.Z, 0, off.X) * human.overshootSign * (2 + math.random() * 3)
     end
 
-    local desired = CFrame.lookAt(cam.CFrame.Position, aimPos)
-
-    -- 指数平滑：smoothness 越大越慢
-    local speed = math.max(cfg.smoothness, 0.01)
-    local alpha = 1 - math.exp(-dt / speed)
-    local newCF = cam.CFrame:Lerp(desired, math.clamp(alpha, 0, 1))
-
-    -- 手抖：真人永远不可能完全静止
-    -- 抖动：连续噪声 + 只在「还没对准」时生效。
-    -- 之前每帧 math.random() 产生 60Hz 高频震颤，幅度还大于每帧转向量，
-    -- 结果就是疯狂抖但瞄不上。已经对准（夹角 < 3°）后不再抖，像真人锁定。
-    if cfg.jitter > 0 then
-        local angErr = (desired.LookVector - cam.CFrame.LookVector).Magnitude
-        if angErr > 0.05 then
-            local now = os.clock()
-            local j = math.rad(cfg.jitter) * 0.5
-            local nx = math.sin(now * 2.3) * 0.6 + math.sin(now * 5.1) * 0.4
-            local ny = math.cos(now * 1.9) * 0.6 + math.cos(now * 4.7) * 0.4
-            newCF = newCF * CFrame.fromEulerAnglesXYZ(nx * j, ny * j, 0)
+    -- ⭐ 首选真实鼠标输入（和「鼠标瞄准」同一条通道）。
+    --
+    -- 为什么不能只写 cam.CFrame：这个游戏的相机控制器每帧重算 CFrame，
+    -- 且执行点比我们的 RenderStep(1997) 更晚 —— 项目里实测「连续 384 帧写 cam.CFrame，
+    -- 视线变化 0.00 度」，写完就被覆盖。也就是说：默认的平滑模式在那种情况下等于没自瞄。
+    -- mousemoverel 走的是引擎输入通道，游戏会当成「玩家转了鼠标」，不会被覆盖。
+    --
+    -- 安全阀（缺一不可，否则会抢走用户的真实鼠标）：
+    --   · 执行器没有 mousemoverel → 退回写 CFrame
+    --   · 窗口没焦点 → 不动
+    --   · 刚有真实键鼠操作（S.lastManualInput，0.6 秒内）→ 让位，用户要能点菜单
+    --   · 焦点在输入框里 → 不动
+    local inTextBox = false
+    if UserInputService then
+        local okTb, tb = pcall(function() return UserInputService:GetFocusedTextBox() end)
+        inTextBox = (okTb and tb ~= nil)
+    end
+    if typeof(mousemoverel) == "function"
+        and (not isrbxactive or isrbxactive())
+        and (os.clock() - (S.lastManualInput or 0)) >= (cfg.mouseReleaseDelay or 0.6)
+        and not inTextBox then
+        local sp = cam:WorldToViewportPoint(aimPos)
+        if sp.Z > 0 then
+            local vp = cam.ViewportSize
+            local dx = sp.X - vp.X * 0.5
+            local dy = sp.Y - vp.Y * 0.5
+            if math.abs(dx) > 2 or math.abs(dy) > 2 then
+                -- ⚠ 「逐帧拉枪」的成因：每帧把剩余距离的 23%、最多 60 像素**一次性**发出去。
+                -- 游戏相机对每个 mousemoverel 事件是直接响应、没有插值的，
+                -- 所以视觉上就是一格一格地跳（用户形容「像 OBS 吸附」）。
+                --
+                -- 修法：
+                --   ① alpha 压低（更小的每帧占比 → 曲线更细腻）
+                --   ② 单步上限从 60 降到 12 像素（不再出现大跳）
+                --   ③ 把这一帧的总位移**拆成 3 次**发出去，中间不等待 ——
+                --      引擎会把它们当成 3 个连续的鼠标事件，相机分 3 次走完，
+                --      视觉上就是连续的而不是一次跳跃。
+                local speed = math.max(tonumber(cfg.smoothness) or 0.25, 0.02)
+                local alpha = math.clamp(1 - math.exp(-dt / speed), 0.02, 0.6)
+                local stepX = math.clamp(dx * alpha, -12, 12)
+                local stepY = math.clamp(dy * alpha, -12, 12)
+                -- ⚠ 一次发完，不要拆成多次。
+                -- 拆成 3 次实测反而更"卡"：引擎把每个 mousemoverel 当成独立的鼠标事件，
+                -- 相机被推着走 3 下，视觉上就是「一格一格吸附」（用户原话：像 OBS 吸附）。
+                -- 单次 + 12 像素上限已经是连续移动了。
+                pcall(function() mousemoverel(stepX, stepY) end)
+                S.smoothMouseSteps = (S.smoothMouseSteps or 0) + 1
+                S.smoothLastStep = string.format("%.2f,%.2f", stepX, stepY)
+            else
+                S.smoothSettled = (S.smoothSettled or 0) + 1
+            end
+            return
         end
     end
 
-    cam.CFrame = newCF
+    -- ⚠ 这里原来是 `cam.CFrame` 回退分支，已删除。
+    --
+    -- 它的问题有两个，第二个是致命的：
+    --   ① 这个游戏的相机控制器每帧重算 CFrame（实测 384 帧写下来变化 0.00 度），
+    --      所以这个分支本来就转不动视角 —— 是死代码。
+    --   ② 但它是 mousemoverel 分支的 **fallback**：用户一拖鼠标，S.lastManualInput
+    --      就会刷新，mousemoverel 被 0.6 秒安全阀挡住 → 恰好掉进这个分支 →
+    --      Lerp 到目标方向强行写 CFrame。用户看到的就是
+    --      「我手动把准星拖出圈外，它还是把视角拽回去」（实测反馈）。
+    -- 没有 mousemoverel 的执行器上，平滑模式本来也做不了事，直接静默退出即可。
+    S.smoothNoMouse = (S.smoothNoMouse or 0) + 1
 end
 
 ---------------------------------------------------------------------
@@ -2058,7 +2852,10 @@ end
 -- 所以：任何真实键鼠操作都暂停鼠标瞄准一段时间，让用户能操作 UI。
 local lastManualInput = 0
 pcall(function()
-    local conn = UIS.InputBegan:Connect(function(input, gameProcessed)
+    -- ⚠ 这里原来写 UIS（全局 nil），整个连接从来没建立成功 —— 后果是
+    -- lastManualInput 永远是 0，安全阀形同虚设：鼠标瞄准会一路抢占光标，
+    -- 用户点菜单/切窗口都点不动。正确名字是开头的 UserInputService。
+    local conn = UserInputService.InputBegan:Connect(function(input, gameProcessed)
         local t = input.UserInputType
         if t == Enum.UserInputType.Keyboard
             or t == Enum.UserInputType.MouseButton1
@@ -2066,20 +2863,32 @@ pcall(function()
             or t == Enum.UserInputType.MouseButton3
             or t == Enum.UserInputType.Touch then
             lastManualInput = os.clock()
+            -- 平滑模式（走 mousemoverel 那条）也用同一个时间戳做安全阀。
+            -- 它定义在 updateSmoothAim 里，函数比这里早，所以只能经 S 传。
+            S.lastManualInput = lastManualInput
         end
     end)
     S.conns[#S.conns + 1] = conn
 end)
 
 local function updateMouseAim(dt)
-    if not (cfg.aimMode == "mouse" and aimActive()) then return end
+    if not ((cfg.aimMode or "smooth") == "mouse" and aimActive()) then return end
     if typeof(mousemoverel) ~= "function" then return end
     -- 窗口没焦点就别动（也是防止误操作别的窗口）
     if isrbxactive and not isrbxactive() then return end
     -- 刚才有真实键鼠操作 → 让出控制权
     if os.clock() - lastManualInput < (cfg.mouseReleaseDelay or 0.6) then return end
-    -- 平移期间不抢鼠标（用户在看背包/买枪菜单）
-    if UIS:GetFocusedTextBox() then return end
+    -- ⚠ 这里原来写的是 UIS，但 UIS 这个 local 直到文件末尾（inputDiag）才定义，
+    -- 在这个作用域里它是**全局 nil** —— 每次执行到这一行就是
+    -- "attempt to index nil with 'GetFocusedTextBox'"，被外层 pcall(updateMouseAim) 吞掉，
+    -- 于是鼠标瞄准（aimMode="mouse"）每次都在这里中断，后面所有转向代码一行都没跑过。
+    -- 正确名字是文件开头 292 行定义的 UserInputService。
+    local inTextBox = false
+    if UserInputService then
+        local okTb, tb = pcall(function() return UserInputService:GetFocusedTextBox() end)
+        inTextBox = (okTb and tb ~= nil)
+    end
+    if inTextBox then return end
 
     local t = aimTarget()
     if not t then return end
@@ -2144,6 +2953,8 @@ local WEAPON_CLASS = {
     -- 冲锋枪
     ["MP9"] = "SMG", ["MAC-10"] = "SMG", ["P90"] = "SMG", ["MP7"] = "SMG",
     ["MP5-SD"] = "SMG", ["PP-Bizon"] = "SMG", ["UMP-45"] = "SMG",
+    -- 机枪（以前漏了，导致 Negev / M249 被当成"未知武器"过滤掉）
+    ["Negev"] = "Rifle", ["M249"] = "Rifle",
     -- 手枪
     ["Glock-18"] = "Pistol", ["USP-S"] = "Pistol", ["P250"] = "Pistol", ["P2000"] = "Pistol",
     ["Five-SeveN"] = "Pistol", ["Tec-9"] = "Pistol", ["Dual Berettas"] = "Pistol",
@@ -2154,7 +2965,7 @@ local WEAPON_CLASS = {
     ["T Knife"] = "Melee", ["CT Knife"] = "Melee", ["Karambit"] = "Melee",
     ["M9 Bayonet"] = "Melee", ["Butterfly Knife"] = "Melee", ["Flip Knife"] = "Melee",
     ["Gut Knife"] = "Melee", ["Skeleton Knife"] = "Melee", ["Stiletto Knife"] = "Melee",
-    ["LightSaber"] = "Melee",
+    ["LightSaber"] = "Melee", ["Zeus x27"] = "Melee",
 }
 
 -- 当前手持武器名：直接看 workspace.Camera 下挂着的模型
@@ -2221,12 +3032,60 @@ local function updateAutoFire(dt)
     local cam = workspace.CurrentCamera
 
     if cfg.autoFire and cam then
+        -- ⚠ C4 下包 / 拆包时必须停自动开火：
+        -- 下包和拆包都要求「持续按住」，而自动开火在反复 mouse1press/release，
+        -- 每隔几毫秒打断一次 → 进度条反复归零，表现是「一到包点就疯狂左键、永远下不完」。
+        -- 判据只有两个：
+        --   1) 手持 C4（准备下包）
+        --   2) HUD 的 PlantBomb / DefuseBomb 进度条可见（正在下包或拆包）
+        -- 注意：拿着拆弹器（Defuse Kit）但没在拆包时**不停**，那时还能正常开枪。
+        do
+            local busy0 = (heldWeaponName() == "C4")
+            -- ⚠ 手持投掷物同样不能自动开火。
+            -- 这个游戏左键的含义随手持物变化：拿枪是「射击」，拿雷是「扔出去」。
+            -- 自动开火只判断「有目标 + 距离够」，而投掷物在 WEAPON_CLASS 里没有条目，
+            -- heldWeaponClass() 会兜底成 Rifle（maxDist=300）——
+            -- 于是 300 stud 内一出现目标就按住左键，表现就是「不知道什么时候把雷全扔光了」。
+            if not busy0 and type(heldIsThrowable) == "function" and heldIsThrowable() then
+                busy0 = true
+            end
+            if not busy0 then
+                local pgA = LP:FindFirstChild("PlayerGui")
+                local midA = pgA and pgA:FindFirstChild("MainGui")
+                    and pgA.MainGui:FindFirstChild("Gameplay")
+                    and pgA.MainGui.Gameplay:FindFirstChild("Middle")
+                if midA then
+                    local pb = midA:FindFirstChild("PlantBomb")
+                    local db = midA:FindFirstChild("DefuseBomb")
+                    if (pb and pb.Visible) or (db and db.Visible) then busy0 = true end
+                end
+            end
+            -- 热身阶段：由 cfg.autoFireWarmup 控制。
+            -- 这个配置以前只定义、从没被读过（死配置）。这里接上，
+            -- 默认 true = 保持原来的行为（热身也开火），想要安静就关掉。
+            if not busy0 and cfg.autoFireWarmup ~= true then
+                local stW = tostring(workspace:GetAttribute("GameState") or "")
+                if stW == "Warmup" then busy0 = true end
+            end
+            if busy0 then
+                if af.mouseDown then pcall(function() mouse1release() end); af.mouseDown = false end
+                return
+            end
+        end
         local t = aimTarget()
         if t and not t.dead then
             -- 按武器类型判断这个距离打不打得着
             local cls = heldWeaponClass()
             local prof = cfg.weaponProfiles[cls]
-            if prof and prof.enabled and t.distance <= prof.maxDist then
+            -- ⚠ Zeus x27：服务器配置 Range=13.584 / Rounds=1 / RechargeTime=30。
+            -- WEAPON_CLASS 里没有它（会默认归 Rifle=300），于是 300 stud 外也开枪、打空。
+            -- 这里按真实范围 13.5 限制。
+            local wnZ = heldWeaponName()
+            local maxFireDist = prof and prof.maxDist or 0
+            local zeusOk = (wnZ == "Zeus x27")
+            if zeusOk then maxFireDist = 13.5 end
+            -- Zeus 归 Melee 槽位，而 Melee 档位默认关；这里让它独立生效，不受档位开关影响
+            if ((prof and prof.enabled) or zeusOk) and t.distance <= maxFireDist then
                 -- 延迟：换目标就重新计时；延迟为 0 时不空转这一帧
                 if af.locking ~= t.name then
                     af.locking = t.name
@@ -2252,13 +3111,39 @@ local function updateAutoFire(dt)
                             end
                         end
                     end
+                    -- ⚠ 被闪光晃到就不该开火。游戏闪光用独立对象（反编译自 VFXLibary.FlashEffect）：
+                    --   PlayerGui "FlashbangEffect"（DisplayOrder 999）
+                    --   Lighting  "FlashbangColorCorrection"
+                    -- 之前查 Lighting.ColorCorrection（游戏基础校正，Brightness 恒 0）→ 永远检测不到。
+                    if pass then
+                        local pgF = game.Players.LocalPlayer:FindFirstChild("PlayerGui")
+                        local flashOn = pgF and pgF:FindFirstChild("FlashbangEffect")
+                        if not flashOn then
+                            local cF = game:GetService("Lighting"):FindFirstChild("FlashbangColorCorrection")
+                            flashOn = cF and cF:IsA("ColorCorrectionEffect") and (tonumber(cF.Brightness) or 0) > 0.1
+                        end
+                        if flashOn then pass = false end
+                    end
+
 
                     -- 视线检测：目标在掩体后就不开火（排除隐形屏障）
+                    -- ⚠ 这里原来只看「有没有命中墙」，跟 cfg.wallbang 完全脱钩 ——
+                    -- 结果就是「静默+360+穿墙都开了，自动开火却永远不打墙后的人」。
+                    -- 现在和 viable() 用同一套判定：材质等级够 且 墙后 ≤ PIERCE_MAX_GAP 才放行。
                     if pass then
                         coverParams.FilterDescendantsInstances = coverIgnoreList()
                         local from = cam.CFrame.Position
                         local hit = workspace:Raycast(from, t.headPos - from, coverParams)
-                        af.blocked = (hit ~= nil)
+                        if hit then
+                            local gap = (t.headPos - hit.Position).Magnitude
+                            local canPen = false
+                            if cfg.wallbang then
+                                canPen = S.canPierce(hit)
+                            end
+                            af.blocked = not (canPen and gap <= (S.PIERCE_MAX_GAP or 8))
+                        else
+                            af.blocked = false
+                        end
                         if not af.blocked then fire = true end
                     end
                 end
@@ -2334,8 +3219,23 @@ local function updateAutoFire(dt)
             end
             if fire and (nowC - (af.lastSingleShot or 0)) >= gap then
                 af.lastSingleShot = nowC
-                pcall(function() mouse1press() end)
-                pcall(function() mouse1release() end)
+                -- ⚠ 三级降级：按住式 → 点击式 → 直接调 shoot()。
+                -- 执行器不一定有鼠标注入 API（Real 实测 mouse1press/mouse1release 可能是 nil），
+                -- 只写前两级的话，单发武器（AWP/手枪）在那种执行器上一枪都打不出去。
+                if canHold then
+                    pcall(function() mouse1press() end)
+                    pcall(function() mouse1release() end)
+                elseif typeof(mouse1click) == "function" then
+                    pcall(function() mouse1click() end)
+                else
+                    local icS = getInvCtrl()
+                    local wS = icS and icS.peekCurrentEquippedForMovement()
+                    if wS and typeof(wS.shoot) == "function" then
+                        pcall(function() wS.NextShotDue = os.clock() - 0.01 end)
+                        pcall(function() wS:shoot() end)
+                        S.autoFireShootFallback = (S.autoFireShootFallback or 0) + 1
+                    end
+                end
                 S.autoFireClicks = (S.autoFireClicks or 0) + 1
                 S.singleShotClicks = (S.singleShotClicks or 0) + 1
             end
@@ -2367,11 +3267,24 @@ local function updateAutoFire(dt)
                     S.autoFireClicks = (S.autoFireClicks or 0) + 1
                 end
             else
-                -- 执行器没有按住式 API 时退回点击，并保留节流
+                -- 执行器没有按住式 API 时退回点击，并保留节流。
+                -- ⚠ 再退一级：连 mouse1click 都没有（Real 实测鼠标注入可能全 nil）时，
+                -- 直接调武器自己的 shoot()。否则「自动开火」在这类执行器上就是
+                -- 开关打开、代码在跑、一枪不开 —— 而 UI 上完全看不出异常。
                 local clickGap = tonumber(cfg.autoFireClickGap) or 0.04
                 if os.clock() - af.lastClick > clickGap then
                     af.lastClick = os.clock()
-                    pcall(function() mouse1click() end)
+                    if typeof(mouse1click) == "function" then
+                        pcall(function() mouse1click() end)
+                    else
+                        local icF = getInvCtrl()
+                        local wF = icF and icF.peekCurrentEquippedForMovement()
+                        if wF and typeof(wF.shoot) == "function" then
+                            pcall(function() wF.NextShotDue = os.clock() - 0.01 end)
+                            pcall(function() wF:shoot() end)
+                            S.autoFireShootFallback = (S.autoFireShootFallback or 0) + 1
+                        end
+                    end
                     S.autoFireClicks = (S.autoFireClicks or 0) + 1
                 end
             end
@@ -2435,12 +3348,12 @@ end
 -- 顺序：1997 平滑瞄准 → 1998 陀螺 → 1999 第三人称 → 2000 绘制
 local okBind = pcall(function()
     RunService:BindToRenderStep("MVHub_Aim", Enum.RenderPriority.Last.Value - 3, function(dt)
-        if REG.gen ~= MY_GEN then return end
+        if S._alive == false or REG.gen ~= MY_GEN then return end
         -- 移动端走 MVHub_AimMobile 那条线，这里跳过避免重复应用平滑
         if not IS_MOBILE then
             -- 鼠标瞄准和"改相机"两条路分开：相机被游戏锁死，只有鼠标输入有效
             pcall(updateMouseAim, dt)
-            if cfg.aimMode == "smooth" then
+            if (cfg.aimMode or "smooth") == "smooth" then
                 pcall(updateSmoothAim, dt)
             end
         end
@@ -2457,7 +3370,7 @@ local mobileFireWindowUntil = 0
 
 local function updateMobileAim(dt)
     if not IS_MOBILE then return end
-    if not (cfg.aimMode == "smooth" and aimActive()) then return end
+    if not (((cfg.aimMode or "smooth") == "smooth") and aimActive()) then return end
     if os.clock() > mobileFireWindowUntil then
         resetHuman()
         return
@@ -2467,7 +3380,7 @@ end
 
 local okBindMobile = pcall(function()
     RunService:BindToRenderStep("MVHub_AimMobile", Enum.RenderPriority.Last.Value - 4, function(dt)
-        if REG.gen ~= MY_GEN then return end
+        if S._alive == false or REG.gen ~= MY_GEN then return end
         pcall(updateMobileAim, dt)
     end)
 end)
@@ -2543,7 +3456,12 @@ if not isRawSend(originalSend) then
     originalSend = shootPacket.Send
     -- 如果当前表字段也被替换过（不是 Network 函数），沿 upvalue 找一层
     if not isRawSend(originalSend) then
-        local up1 = select(2, debug.getupvalue(originalSend, 1))
+        -- ⚠ Real 的 debug.getupvalue(fn, i) 只返回「值」，没有 name
+        -- （标准 Lua 才是 (name, value)）。这里原来写 select(2, ...)，在 Real 上恒为 nil，
+        -- 于是「沿 upvalue 找回真正的 Network 函数」从来没生效过。
+        -- 后果：一旦 getgenv().MV_ORIG_SEND 丢失或被污染，originalSend 就停在旧 wrapper 上，
+        -- 每次开火多套一层改写，重载几次越叠越深，极端情况（wrapper 指回自己）直接栈溢出。
+        local up1 = debug.getupvalue(originalSend, 1)
         if isRawSend(up1) then
             originalSend = up1
         end
@@ -2606,10 +3524,21 @@ shootPacket.Send = function(payload)
     --
     -- 这个函数只在「玩家真的开了一枪」时才会被调用（shootPacket.Send 内部），
     -- 所以只看 silentAim 不会导致「看一眼就自动开枪」——开枪仍由 autoFire 控制。
-    local shouldAim = (cfg.silentAim == true)
+    -- ⚠ 只有 aimMode == "silent" 时才改写弹道。
+    -- 之前只看 silentAim，导致「选了平滑瞄准，子弹还是自己拐弯」——用户实测反馈的正是这个。
+    -- 现在的语义：
+    --   aimMode = "smooth"  → 只转视角，子弹按准星飞（安全）
+    --   aimMode = "silent"  → 改 Bullets[].Direction（不动视角）
+    --   aimMode = "mouse"   → 真实鼠标输入，不动弹道
+    -- silentAim 仍然保留为总开关（关掉就什么都不做）。
+    local shouldAim = (cfg.silentAim == true) and ((cfg.aimMode or "smooth") == "silent")
     local target = nil
 
-    if shouldAim or cfg.multiShot then
+    -- ⚠ target 的触发条件不能只有「静默 or 多发」：
+    -- 下面的 wallbang / bulletTrack 全靠 target 才执行，而它们在 UI 上是独立开关。
+    -- 以前这里只写 shouldAim or cfg.multiShot —— 于是「开了穿墙 / 子弹追踪、但没开静默」
+    -- 时 target 恒为 nil，那两个功能永远走不到，用户看到的就是「开关打开了没反应」。
+    if shouldAim or cfg.multiShot or cfg.wallbang or cfg.bulletTrack then
         target = aimTarget()
         if target then
             S.lastTarget = target.name
@@ -2831,8 +3760,12 @@ shootPacket.Send = function(payload)
                 -- 实测：shots=56 / rewritten=2（改写率 3.6%），vDbg 全是 "dead"——
                 -- 第一发把人打死后，之后每次 shoot() 里 aimTarget() 都返回 nil，
                 -- 那些子弹就全部照准星方向飞出去（打墙），既浪费弹药又可能误伤队友。
-                -- 静默模式下没有目标就没有继续补发的意义，直接跳出。
-                if cfg.silentAim then
+                -- 静默 / 追踪类补发只在「当前确实有目标」时才有意义：
+                -- 目标死了 aimTarget() 返回 nil，补发的子弹会照准星方向飞（打墙、误伤）。
+                -- ⚠ 判据用 shouldAim 而不是裸 cfg.silentAim：
+                -- 只有 aimMode=="silent" 时才会改写弹道，smooth/mouse 下补发本来就是
+                -- 「多发空枪」，不该拿静默开关当条件（它会和 multiShot 混在一起误判）。
+                if shouldAim then
                     local okA, stillThere = pcall(function()
                         return aimTarget() ~= nil
                     end)
@@ -2932,6 +3865,55 @@ AASYS.installSmooth = function()
     smoothRP.FilterType = Enum.RaycastFilterType.Exclude
     smoothRP.IgnoreWater = true
 
+    -- ★ 可穿透判定 —— 「瞄空气」的头号元凶就在这。
+    --
+    -- 实测：地图上有 104 个 `snow decal`（parent=ground snow），
+    --   size=(92.2, 0.0, 33.4)  Transparency=1.00  CanCollide=true
+    -- 零厚度、完全看不见、但 Raycast 一打就中。玩家站在雪坡上时，
+    -- 视线从相机到目标必然穿过某个面 → 每帧都被判「被挡」→ 自瞄永远放弃。
+    --
+    -- ⚠ 只需要看 Transparency：104 个雪面全是 1.00，这一条就全放行了。
+    --   **不需要名字白名单**（那玩意儿会随地图膨胀，换个图就废）。
+    --   CanCollide 检查也只是顺手，因为 Raycast 本来就不看它。
+    local function mvIsPenetrable(p)
+        if not p then return true end
+        if p.Transparency >= 0.9 then return true end   -- 雪面贴花 / 隐形屏障 / 碎玻璃
+        if p.CanCollide == false then return true end   -- 打碎后移除碰撞的玻璃
+        return false
+    end
+    S.MVIsPenetrable = mvIsPenetrable
+
+    -- 穿透式可见性。
+    --
+    -- ⚠ 性能：默认只做 **1 层**（和原版一样的射线次数，只多一个 if，零额外成本）。
+    --   只有当「雪面 + 玻璃 + 铁丝网」叠在一起时才会误判，那种情况极少；
+    --   真要处理就把 cfg.aimPenetrateLayers 调到 2~3，代价是每多一层多一次 Raycast。
+    --   不做名字白名单：会膨胀，而且换地图就失效。
+    local function mvIsVisible(from, to)
+        local dir = to - from
+        local dist = dir.Magnitude
+        if dist < 0.05 then return true end
+        local unit = dir.Unit
+        local cur = from
+        local remain = dist
+        local layers = math.clamp(tonumber(cfg and cfg.aimPenetrateLayers) or 1, 1, 4)
+        for _ = 1, layers do
+            local hit = workspace:Raycast(cur, unit * remain, smoothRP)
+            if not hit then return true end
+            if not mvIsPenetrable(hit.Instance) then
+                S.smoothAimLastBlocker = hit.Instance.Name
+                return false
+            end
+            S.smoothAimPenetrated = (S.smoothAimPenetrated or 0) + 1
+            local advanced = (hit.Position - cur).Magnitude + 0.1
+            cur = hit.Position + unit * 0.1
+            remain = remain - advanced
+            if remain <= 0 then return true end
+        end
+        return false
+    end
+    S.MVIsVisible = mvIsVisible
+
     -- ⚠ 不再转交给「原始」函数。
     --
     -- 实测 debug.info(AA.GetMagnetismRotation, "s") == [string "mv_hub_v2"] ——
@@ -2946,7 +3928,21 @@ AASYS.installSmooth = function()
     local setOk = pcall(function()
         -- 先存一份到 getgenv，供 S.updateSpinCam 里的「磁吸守护」每帧比对/重装。
         -- 换局时游戏可能把这个字段重新赋值，守护逻辑靠这个引用把它焊回来。
-        AA.GetMagnetismRotation = function(dt)
+        --
+        -- ★★★ 2026-11-06 修复「自瞄完全没用」的真因 ★★★
+        -- S.updateSpinCam 里的磁吸守护（约 7376 行）每帧做这件事：
+        --     if type(getgenv().MV_MAG_HOOK) ~= "function" then
+        --         getgenv().MV_MAG_HOOK = zeroVec2
+        --         AA.GetMagnetismRotation = zeroVec2   -- 恒返回 (0,0)
+        --     end
+        -- 原来这里只赋值 AA.GetMagnetismRotation，**从来没有登记 MV_MAG_HOOK**，
+        -- 于是加载后第一帧守护就把平滑 hook 覆盖成 zeroVec2：
+        -- 平滑 hook 一次都没被游戏调用过（S.smoothAimTicks 恒为 0）。
+        -- 这跟「热补丁没落盘」无关，是主脚本内部的逻辑冲突。
+        -- 现在把 hook 存进局部变量，赋给 AA 之后**同时登记到 getgenv**，
+        -- 守护的 if 条件就不成立，平滑 hook 才能活下来。
+        local magHook
+        magHook = function(dt)
             -- 计数：这个函数被游戏调用了几次。
             -- 静默模式下如果这个数一直是 0，说明脚本根本没有插手相机；
             -- 如果它涨了但 smoothAimSuppressed=true，说明我们主动返回了 (0,0)。
@@ -2982,19 +3978,58 @@ AASYS.installSmooth = function()
             -- 所以这里直接从 allTargets() 挑最近的，并且要求视线通畅。
             -- 原来没有视线检测，表现为「隔着重重掩体也一直锁着一个人」。
             local drop = tonumber(cfg.smoothAimDrop) or 0.9
+            -- ⚠ 距离上限必须按「手里的枪」算，不是全局 500。
+            -- 原来写死 cfg.maxAimDist（500），于是拿刀 / 霰弹枪时这条链路会转身去锁
+            -- 500 stud 外的人 —— 目标在射程外，转过去也只是对着空气。
+            -- aimTarget 早就改成 aimDistByWeapon 了，这里一直没跟上。
+            local safeMax = tonumber(cfg.maxAimDist) or 500
+            do
+                local okwN, wN = pcall(function()
+                    local icN = getInvCtrl()
+                    return icN and icN.peekCurrentEquippedForMovement()
+                end)
+                if okwN and wN and wN.Name and cfg.aimDistByWeapon then
+                    local dN = cfg.aimDistByWeapon[tostring(wN.Name)]
+                    if dN then safeMax = dN end
+                end
+            end
+            S.smoothAimMaxNow = safeMax
+            -- ⚠ 平滑模式必须自己做 FOV 圈检查。
+            --
+            -- viable() 里虽然有 `d > cfg.fov → 拒绝`，但平滑 hook 用的是 allTargets()，
+            -- **根本不经过 viable()** —— 所以 FOV 圈对它从来没生效过：
+            -- 用户手动把目标拖出圈外，它照样一路把视角拽过去（实测）。
+            -- 这里按同一口径补上：屏幕坐标距中心超过 cfg.fov 就不算候选。
+            local vpS = cam.ViewportSize
+            local centerS = Vector2.new(vpS.X * 0.5, vpS.Y * 0.5)
+            local fovS = tonumber(cfg.fov) or 75
             local best, bestD = nil, math.huge
             for _, t in ipairs(allTargets()) do
                 -- 冻结目标不转视角：那个位置可能只是敌人最后一次被看到的点，
                 -- 人早走了，转过去就是对着空气硬锁。
                 local okT = (not t.dead) and (not t.frozen)
                 if cfg.teamCheck and t.sameTeam then okT = false end
-                if t.distance > (cfg.maxAimDist or 500) then okT = false end
+                if t.distance > safeMax then okT = false end
+                -- FOV 圈（全向模式只对静默有意义，平滑永远受圈限制）
+                if okT then
+                    local spS = cam:WorldToViewportPoint(t.headPos)
+                    if spS.Z <= 0 then
+                        okT = false
+                    elseif (Vector2.new(spS.X, spS.Y) - centerS).Magnitude > fovS then
+                        okT = false
+                    end
+                end
                 if okT and t.distance < bestD then
                     local aimAt = t.headPos - Vector3.new(0, drop, 0)
                     smoothRP.FilterDescendantsInstances = coverIgnoreList()
-                    local hit = workspace:Raycast(eyePos, aimAt - eyePos, smoothRP)
-                    if not hit then
+                    -- ★ 用穿透式可见性替代原来的「命中即放弃」。
+                    --   原来 `local hit = workspace:Raycast(...) if not hit then best = t end`
+                    --   会把 104 个零厚度透明 snow decal、半透明玻璃、隐形屏障全当成墙，
+                    --   站在雪坡上时视线必穿雪面 → 永远不锁 → 表现为「瞄空气」。
+                    if mvIsVisible(eyePos, aimAt) then
                         best, bestD = t, t.distance
+                    else
+                        S.smoothAimBlocked = (S.smoothAimBlocked or 0) + 1
                     end
                 end
             end
@@ -3021,17 +4056,22 @@ AASYS.installSmooth = function()
             -- 平滑要做两件事：
             --   1) 比例缩放：每帧只走剩余角度的一部分（指数逼近，越近越慢）
             --   2) 每帧硬上限：大角度时也别超过设定值，避免远处目标被瞬移锁死
-            local speed = math.clamp(tonumber(cfg.smoothAimSpeed) or 0.12, 0.02, 1)
-            local maxDeg = math.clamp(tonumber(cfg.smoothAimMaxDeg) or 1.5, 0.2, 5)
+            --
+            -- ⚠ 下限必须够低，否则 GUI 滑条拉到底也没用（用户实测「不吃人性化设置」）。
+            --   原来 maxDeg 下限是 0.2 度/帧 —— 10 度偏差 50 帧 ≈ 0.2 秒就到位，就是硬锁。
+            --   现在放到 0.01 度/帧：10 度需要 1000 帧 ≈ 4 秒，足够滑。
+            local speed = math.clamp(tonumber(cfg.smoothAimSpeed) or 0.12, 0.005, 1)
+            local maxDeg = math.clamp(tonumber(cfg.smoothAimMaxDeg) or 1.5, 0.01, 5)
             local cap = math.rad(maxDeg)
             dYaw = math.clamp(dYaw * speed, -cap, cap)
             dPitch = math.clamp(dPitch * speed, -cap, cap)
 
-            -- 死区：已经很接近就别再动，否则会在目标点附近来回微抖
-            local dead = math.rad(tonumber(cfg.smoothAimDeadzone) or 0.3)
-            if math.abs(dYaw) < dead then dYaw = 0 end
-            if math.abs(dPitch) < dead then dPitch = 0 end
-
+            -- ⚠ 抖动必须在死区判断**之前**加。
+            --
+            -- 原来的顺序是「先死区清零、再加抖动」：deadzone 把角度清成 0 之后，
+            -- jitter 又塞进一个非零值 → 每一帧都有位移 → 准星永远不会停，
+            -- 表现为「视角反复反复反复调整」（用户实测）。
+            -- 正确顺序：先加抖动，再让死区把「小于阈值」的抖动一起吃掉。
             if cfg.smoothAimJitter and cfg.smoothAimJitter > 0 then
                 local j = math.rad(cfg.smoothAimJitter)
                 local now = os.clock()
@@ -3039,9 +4079,18 @@ AASYS.installSmooth = function()
                 dPitch = dPitch + math.cos(now * 6.1) * j * 0.3
             end
 
+            -- 死区：已经很接近就别再动，否则会在目标点附近来回微抖
+            local dead = math.rad(tonumber(cfg.smoothAimDeadzone) or 0.3)
+            if math.abs(dYaw) < dead then dYaw = 0 end
+            if math.abs(dPitch) < dead then dPitch = 0 end
+
             S.smoothAimTicks = (S.smoothAimTicks or 0) + 1
             return Vector2.new(dYaw, dPitch)
         end
+        -- ★ 把平滑 hook 真正挂上去，并登记到 getgenv().MV_MAG_HOOK。
+        --   少这一步 = 磁吸守护下一帧就用 zeroVec2 覆盖掉它。
+        AA.GetMagnetismRotation = magHook
+        getgenv().MV_MAG_HOOK = magHook
     end)
     AASYS.smoothOK = setOk
     return setOk
@@ -3384,7 +4433,9 @@ end
 -- 所以这段能力已彻底移除。
 local function ammoStep()
     if cfg.infiniteAmmo then pcall(applyInfiniteAmmo) end
-    if cfg.skipFireDelay then pcall(applySkipFireDelay) end
+    -- 压 NextShotDue 也只是给 hyperFire 用的：关了 hyperFire 就不能动冷却，
+    -- 否则全自动枪的节奏被压成「冷却永远已过」，射速超过 FireRate 服务端就整包丢（有枪声没伤害）。
+    if cfg.skipFireDelay and cfg.hyperFire then pcall(applySkipFireDelay) end
     if cfg.instantReload then pcall(applyInstantReload) end
     if cfg.skipFireDelay then pcall(applyMeleeSpeed) end
     if cfg.hyperFire then pcall(S.applyHyperFire) end
@@ -3481,7 +4532,7 @@ setInfiniteAmmo = function(on)
     if S.ammoConn then return true end
     local ok = pcall(function()
         S.ammoConn = RunService.Heartbeat:Connect(function()
-            if REG.gen ~= MY_GEN then
+            if S._alive == false or REG.gen ~= MY_GEN then
                 pcall(function() S.ammoConn:Disconnect() end)
                 return
             end
@@ -3574,16 +4625,170 @@ S.patchGetCurrentEquipped = function()
     local okR, ic = pcall(require, game.ReplicatedStorage.Controllers.InventoryController)
     if not okR or type(ic) ~= "table" then return false, "cannot require" end
     if type(ic.getCurrentEquipped) ~= "function" then return false, "no func" end
-    if getgenv().MV_GCE_PATCHED then return true, "already" end
-    getgenv().MV_ORIG_GCE = ic.getCurrentEquipped
-    local peek = ic.peekCurrentEquippedForMovement
-    ic.getCurrentEquipped = function()
-        if type(peek) == "function" then
-            return peek()
+    local resolve = getgenv().MV_RESOLVE_EQUIPPED
+    if type(resolve) ~= "function" then
+        -- 兜底：脚本开头那段补丁没跑成功（Controllers 还没复制完 / require 失败）时，
+        -- 这里自带一份同样的契约实现，保证装备查询永远不会返回 JSON 表。
+        local HSx = game:GetService("HttpService")
+        resolve = function(mod)
+            local lp = game.Players.LocalPlayer
+            local raw = lp and lp:GetAttribute("CurrentEquipped")
+            if type(raw) ~= "string" then return nil end
+            local okj, want = pcall(function() return HSx:JSONDecode(raw) end)
+            if not okj or type(want) ~= "table" then return nil end
+            local okInv, inv = pcall(function() return mod.getCurrentInventory() end)
+            if not okInv or type(inv) ~= "table" then return nil end
+            for si = 1, 16 do
+                local slot = inv[si]
+                if type(slot) == "table" and type(slot._items) == "table" then
+                    for _, item in ipairs(slot._items) do
+                        if type(item) == "table" and item.Identifier == want.Identifier then
+                            return item
+                        end
+                    end
+                end
+            end
+            return nil
         end
-        return nil
+        getgenv().MV_RESOLVE_EQUIPPED = resolve
     end
+
+    -- ⚠ 这里不再有 `if MV_GCE_PATCHED then return "already"` 的早退：
+    -- 开头那段补丁如果因为 Controllers 还没复制而失败，后面这次必须能补上；
+    -- 重载脚本时也必须把新实例的解析器重新挂上去（否则 ic 上留着旧实例的死闭包，
+    -- 症状是「重载后物品栏又开始脱节」，但日志仍然显示 patch=true）。
+    local curPeekX = ic.peekCurrentEquippedForMovement
+    local curGCEX = ic.getCurrentEquipped
+    local origOfX = getgenv().MV_ORIG_OF
+    if type(getgenv().MV_ORIG_PEEK) ~= "function" then
+        getgenv().MV_ORIG_PEEK = (origOfX and origOfX(curPeekX)) or curPeekX
+    end
+    if type(getgenv().MV_ORIG_GCE) ~= "function" then
+        getgenv().MV_ORIG_GCE = (origOfX and origOfX(curGCEX)) or curGCEX
+    end
+    S._origGCE = getgenv().MV_ORIG_GCE
+    S._origPeek = getgenv().MV_ORIG_PEEK
+
+    -- ⚠ 与开头补丁用同一份契约实现（getgenv().MV_RESOLVE_EQUIPPED）：
+    -- 返回背包里的真实 item，找不到返回 nil；永远不返回 JSON 表，永远不调原函数。
+    local function resolveReal()
+        return resolve(ic)
+    end
+    getgenv().MV_MARK_WRAP(resolveReal, getgenv().MV_ORIG_PEEK)
+
+    ic.getCurrentEquipped = resolveReal
+    -- ⚠ peekCurrentEquippedForMovement 才是游戏内部的主要查询入口
+    -- （武器组件、输入、切枪、投掷物都走它，而不是 getCurrentEquipped）。
+    ic.peekCurrentEquippedForMovement = resolveReal
+
     getgenv().MV_GCE_PATCHED = true
+    return true, "patched"
+end
+
+-- ═══════════════════════════════════════════════════════════════
+-- ★ Raycast 模块反作弊拦截
+--
+-- 反编译自 ReplicatedStorage.Shared.Raycast（docId 905，341 行）：
+--   function u115.cast(...)          -- 第 253 行起
+--   function u115.castThrough(...)   -- 第 313 行起
+-- 两个函数开头都是同一段：
+--     for i = 1, 10 do
+--         if not debug.info(i, "f") then break end
+--         v1 = getfenv(i)
+--         if v1.getgenv or v1.hookfunction then u115 = {} end
+--     end
+-- u115 是模块的 upvalue（require 返回的就是它）。一旦被换成空表，
+-- 内部所有 u115.cast / castThrough 调用立刻变成 nil → 射线、弹道、
+-- 可见性判定整条崩掉，表现是「买的东西不进包、手里空气、打不中人」。
+--
+-- 绕法：直接覆盖表上的 cast / castThrough。游戏内部调的是 u115.cast，
+-- 而 u115 就是我们 require 到的那张表，所以覆盖即生效，检测代码永不执行。
+-- 必须在反作弊首次触发之前调用（脚本加载早期）。
+-- ═══════════════════════════════════════════════════════════════
+S.patchRaycast = function()
+    local okR, mod = pcall(function()
+        return require(game:GetService("ReplicatedStorage").Shared.Raycast)
+    end)
+    if not okR or type(mod) ~= "table" then return false, "cannot require" end
+
+    -- 幂等：重载时 mod.cast 上挂的已经是上一实例的 wrapper，
+    -- 通过 MV_ORIG_OF 取真正的原版，绝不把 wrapper 当原版存起来。
+    local curCast = mod.cast
+    local curThrough = mod.castThrough
+    local origOfR = getgenv().MV_ORIG_OF
+    if type(getgenv().MV_ORIG_CAST) ~= "function" then
+        getgenv().MV_ORIG_CAST = (origOfR and origOfR(curCast)) or curCast
+    end
+    if type(getgenv().MV_ORIG_CASTTHROUGH) ~= "function" then
+        getgenv().MV_ORIG_CASTTHROUGH = (origOfR and origOfR(curThrough)) or curThrough
+    end
+    local origCast = getgenv().MV_ORIG_CAST
+    local origThrough = getgenv().MV_ORIG_CASTTHROUGH
+
+    -- 重写 cast：保留「打到了就返回 {instance,position,normal,material}」的语义，
+    -- 去掉 getfenv 检测循环。
+    mod.cast = function(origin, dir, params, filterList, filterFn)
+        local okc, res = pcall(function()
+            local p = params
+            if not p then
+                p = RaycastParams.new()
+                p.FilterType = Enum.RaycastFilterType.Exclude
+                p.IgnoreWater = false
+                p.CollisionGroup = "Bullet"
+            end
+            local fl = filterList
+            if type(fl) ~= "table" then fl = {} else
+                local copy = {}
+                for i, v in ipairs(fl) do copy[i] = v end
+                fl = copy
+            end
+            p.FilterDescendantsInstances = fl
+            local pos = origin
+            local guard = 0
+            while guard < 32 do
+                guard = guard + 1
+                local r = workspace:Raycast(pos, dir, p)
+                if not r then return { position = origin + dir } end
+                local skip = false
+                if type(filterFn) == "function" then
+                    local okf, sr = pcall(filterFn, r.Instance)
+                    skip = okf and sr == true
+                end
+                if not skip then
+                    return {
+                        instance = r.Instance,
+                        position = r.Position,
+                        normal = r.Normal,
+                        material = r.Material,
+                    }
+                end
+                table.insert(fl, r.Instance)
+                p.FilterDescendantsInstances = fl
+            end
+            return { position = origin + dir }
+        end)
+        if okc then return res end
+        -- 兜底：最简射线
+        local r2 = workspace:Raycast(origin, dir)
+        if r2 then
+            return { instance = r2.Instance, position = r2.Position, normal = r2.Normal, material = r2.Material }
+        end
+        return { position = origin + dir }
+    end
+
+    -- castThrough：语义是「穿透指定材质」。这里退回普通 cast（不再穿透），
+    -- 保证不崩、能返回结果；真正的穿透判定交给调用方自己处理。
+    mod.castThrough = function(origin, dir, maxDist, filterList)
+        return mod.cast(origin, dir, nil, filterList, nil)
+    end
+    mod.castThroughDistance = function(origin, dir, maxDist, filterList)
+        return mod.cast(origin, dir, nil, filterList, nil)
+    end
+    -- 打标记：卸载 / 重载时据此判断「表上的到底是不是我们的 wrapper」。
+    getgenv().MV_MARK_WRAP(mod.cast, origCast)
+    getgenv().MV_MARK_WRAP(mod.castThrough, origThrough)
+
+    getgenv().MV_RAYCAST_PATCHED = true
     return true, "patched"
 end
 
@@ -3895,11 +5100,64 @@ S.restoreAllHooks = function()
                 getgenv().MV_ORIG_SETRECOIL
         end
     end)
+    -- ⚠ weaponKick 才是真正把后座「立即」写进相机弹簧的那个（见 S.noRecoilHook 的注释）。
+    -- 以前只还原了 setWeaponRecoil，weaponKick 的 wrapper 一直挂着 ——
+    -- 功能上它会转发给原版，但卸载/重载后多一层死闭包，而且 cfg.noRecoil 被新实例
+    -- 改成 true 时，旧 wrapper 会跟着拦。
+    pcall(function()
+        local kickOrig = getgenv().MV_ORIG_WEAPONKICK
+        if typeof(kickOrig) == "function" then
+            require(game.ReplicatedStorage.Controllers.CameraController).weaponKick = kickOrig
+        end
+    end)
+    -- 准星链路：getWeaponKickRotation 的缩放包装也要还原，
+    -- 否则卸载后准星会一直按「已压枪」的缩小值来画，看起来偏得莫名其妙。
+    pcall(function()
+        local krotOrig = getgenv().MV_ORIG_KICKROT
+        if typeof(krotOrig) == "function" then
+            require(game.ReplicatedStorage.Controllers.CameraController).getWeaponKickRotation = krotOrig
+        end
+    end)
     pcall(function()
         if typeof(getgenv().MV_ORIG_MAG) == "function" then
             require(game.ReplicatedStorage.Controllers.AimAssistController).GetMagnetismRotation =
                 getgenv().MV_ORIG_MAG
         end
+    end)
+    -- ⚠ 以下三类 hook 以前完全没被还原，重载/卸载后它们仍然挂在游戏模块上：
+    --   ① InventoryController.getCurrentEquipped / peekCurrentEquippedForMovement
+    --   ② Shared.Raycast.cast / castThrough
+    --   ③ Skins.GetCameraModel
+    -- 后果分别是：重载后物品栏继续脱节但日志显示 patch=true、
+    -- 射线继续走我们的实现、换肤表被旧闭包继续套用（皮肤关不掉）。
+    -- 注意：①②的原函数体内带 getfenv 检测，这里只还原、不调用；
+    -- 还原之后游戏再调就回到原版行为，想彻底干净要重进服务器（与原设计一致）。
+    pcall(function()
+        local ic = require(game.ReplicatedStorage.Controllers.InventoryController)
+        local op = getgenv().MV_ORIG_PEEK
+        local og = getgenv().MV_ORIG_GCE
+        if typeof(op) == "function" then ic.peekCurrentEquippedForMovement = op end
+        if typeof(og) == "function" then ic.getCurrentEquipped = og end
+        getgenv().MV_GCE_PATCHED = nil
+    end)
+    pcall(function()
+        local rc = require(game.ReplicatedStorage.Shared.Raycast)
+        local oc = getgenv().MV_ORIG_CAST
+        local ot = getgenv().MV_ORIG_CASTTHROUGH
+        if typeof(oc) == "function" then rc.cast = oc end
+        if typeof(ot) == "function" then rc.castThrough = ot end
+        getgenv().MV_RAYCAST_PATCHED = nil
+    end)
+    pcall(function()
+        local orig = S.skinOrigGetCameraModel
+        local lib = S.getSkinsLib and S.getSkinsLib()
+        if orig and lib and lib.GetCameraModel ~= orig then
+            lib.GetCameraModel = orig
+        end
+        S.skinHookInstalled = false
+    end)
+    pcall(function()
+        if S.attrHook and S.removeAttrHook then S.removeAttrHook() end
     end)
     S.noRecoilHookOn = nil
 end
@@ -4164,7 +5422,7 @@ end
 -- 所以信号名和连接都挂在 S 上。
 S.spinSignalName = RunService.PreRender and "PreRender" or "RenderStepped"
 S.spinConn = (RunService.PreRender or RunService.RenderStepped):Connect(function(dt)
-    if REG.gen ~= MY_GEN then return end
+    if S._alive == false or REG.gen ~= MY_GEN then return end
     pcall(S.applyLocalSpin, dt)
 end)
 
@@ -4183,6 +5441,69 @@ S.getSkinsLib = function()
     local ok, m = pcall(require, game.ReplicatedStorage.Database.Components.Libraries.Skins)
     return (ok and type(m) == "table") and m or nil
 end
+
+-- ═══ 换刀 / 换武器外观（纯本地视觉，服务端零感知）═══
+--
+-- 原理：游戏建 viewmodel 时调 Skins.GetCameraModel(武器名, 皮肤, 磨损, ...)，
+-- 我们把「武器名」换成目标武器，游戏就构建目标武器的整套模型
+-- （MeshPart + Motor6D + 手臂，实测 Butterfly Knife = other/Handle/Handle2/Blade）。
+-- 挂载时游戏自己会用**当前武器名**给模型命名（实测 workspace.Camera 下是 "Glock-18"），
+-- 所以名字不用我们管，游戏查找 viewmodel 的逻辑完全不受影响。
+--
+-- 为什么这条能成、而之前三条都不行：
+--   · 改 item.Name / CurrentEquipped → 游戏重建时丢弃，还会破坏背包同步
+--   · 新建模型挂回 Camera → 没有游戏的每帧 CFrame 绑定，玩家一走就留在原地
+--   · 改 Viewmodel.Model 引用 → 两个模型叠在一起打架
+-- 而 hook GetCameraModel 是在**游戏自己构建的那一刻**换掉源武器，
+-- 出来的就是游戏亲生的 viewmodel：绑定、动画、相机跟随全部正常。
+--
+-- 皮肤：换刀后必须用**目标刀自己的皮肤**（T Knife 只有 Stock；
+-- 蝴蝶刀有 Fade / Damascus / Blackwidow / Nebula_PATTERN_* 等），
+-- 所以 want 的取值也跟着换成目标武器的皮肤表。
+-- ⚠ 整段包在 IIFE 里：主 chunk 的 local 槽位已经贴 200 上限，
+--    这里任何一个新 local 都会让整份脚本编译失败（loadstring 只会静默返回 nil）。
+do (function()
+S.meleeSwap = S.meleeSwap or {
+    ["T Knife"]  = "Butterfly Knife",
+    ["CT Knife"] = "Karambit",
+}
+
+-- 当前武器「实际用于建模型的武器名」。换刀关掉时原样返回。
+S.modelWeaponOf = function(wn)
+    wn = tostring(wn or "")
+    if cfg.meleeSwapOn == false then return wn end
+    local to = S.meleeSwap and S.meleeSwap[wn]
+    if to and to ~= "" and to ~= wn then return tostring(to) end
+    return wn
+end
+
+-- 换刀设置入口（会立刻重建 viewmodel 让效果当场生效）
+--   MV_SWAP_KNIFE("T Knife", "Butterfly Knife")   指定映射
+--   MV_SWAP_KNIFE("T Knife", "")                  取消这把刀的映射
+--   MV_SWAP_KNIFE(nil, nil, false)                整体关闭换刀
+getgenv().MV_SWAP_KNIFE = function(from, to, enable)
+    if enable ~= nil then cfg.meleeSwapOn = (enable == true) end
+    if type(from) == "string" then
+        S.meleeSwap = S.meleeSwap or {}
+        if to == nil or to == "" then
+            S.meleeSwap[from] = nil
+        else
+            S.meleeSwap[from] = tostring(to)
+        end
+    end
+    -- 手里正拿着这把刀 → 立刻重建，否则要等切枪
+    local ok, w = pcall(function()
+        local ic = getInvCtrl()
+        return ic and ic.peekCurrentEquippedForMovement()
+    end)
+    if ok and w and w.Name and S.rebuildViewmodel then
+        pcall(function() S.rebuildViewmodel(tostring(w.Name)) end)
+    end
+    local out = {}
+    for k, v in pairs(S.meleeSwap or {}) do out[#out + 1] = tostring(k) .. "→" .. tostring(v) end
+    return string.format("换刀=%s | %s", tostring(cfg.meleeSwapOn ~= false), table.concat(out, ", "))
+end
+end)() end
 
 S.getCurrentWeapon = function()
     local raw = game.Players.LocalPlayer:GetAttribute("CurrentEquipped")
@@ -4206,7 +5527,712 @@ end
 --
 -- 所以默认**禁用**写属性。cfg.skinWriteAttr 必须手动打开才会真的写，
 -- 而打开后请立刻关掉，并重新进服恢复背包。
+-- ═════ 本地视觉换肤（安全版，替代写属性那条路）═════
+--
+-- 为什么不再写 CurrentEquipped：
+--   那是服务端下发的装备数据，背包/拾取/购买全读它。本地改它 = 伪造装备状态，
+--   实测会和服务端同步打架（买东西不进、捡的消失、主武器切不出来）。
+--
+-- 现在只改 viewmodel：Workspace.Camera.<武器名> 下面的 MeshPart.TextureID。
+--   皮肤库 Skins.GetSkinInformation(weapon, skin).wearImages[1].assetId 就是磨损贴图 id，
+--   直接把当前手持模型的所有 MeshPart 换成它 —— 纯本地，服务端完全不知道。
+--   换枪时 CurrentEquipped 会变，下面挂了监听自动重放，所以「换成哪把枪都生效」。
+S.skinVis = { weapon = nil, skin = nil, orig = {} }
+
+S.applySkinVisual = function(skinName)
+    local cur = S.getCurrentWeapon()
+    if not cur then return false, "没有手持武器" end
+    local lib = S.getSkinsLib()
+    if not lib then return false, "皮肤库不可用" end
+    local ok, info = pcall(lib.GetSkinInformation, tostring(cur.Name), tostring(skinName))
+    if not ok or type(info) ~= "table" then return false, "皮肤不存在: " .. tostring(skinName) end
+    local wid
+    if type(info.wearImages) == "table" and info.wearImages[1] then
+        wid = info.wearImages[1].assetId
+    end
+    if not wid then return false, "该皮肤没有贴图（可能只有模型没有贴图）" end
+    local cam = workspace:FindFirstChild("Camera")
+    local model = cam and cam:FindFirstChild(tostring(cur.Name))
+    if not model then return false, "找不到 viewmodel（可能还没建好）" end
+
+    local n = 0
+    for _, d in ipairs(model:GetDescendants()) do
+        if d:IsA("MeshPart") then
+            S.skinVis.orig[d] = S.skinVis.orig[d] or d.TextureID
+            local okSet = pcall(function() d.TextureID = wid end)
+            if okSet then n = n + 1 end
+        end
+    end
+    S.skinVis.weapon = tostring(cur.Name)
+    S.skinVis.skin = tostring(skinName)
+    S.skinVis.assetId = wid
+    return n > 0, string.format("%s / %s（%d 个部件）", tostring(cur.Name), tostring(skinName), n)
+end
+
+S.clearSkinVisual = function()
+    for d, tex in pairs(S.skinVis.orig) do
+        pcall(function() if d and d.Parent then d.TextureID = tex end end)
+    end
+    S.skinVis.orig = {}
+    S.skinVis.weapon = nil
+    S.skinVis.skin = nil
+    return true
+end
+
+-- ═══════════════════════════════════════════════════════════════
+-- 皮肤中文名 + 浏览器（带贴图 / 3D 预览）
+--
+-- 皮肤名来自游戏数据（"Lore"/"High Octane"…），全部英文。这里做一张常用表，
+-- 没收录的保持原名（总比翻错强）。
+-- 图片两个来源，都从游戏自己的 Skins 库取：
+--   Skins.GetWearImageForFloat(item, 0.01)  -> 磨损贴图 assetId（列表缩略图用）
+--   Skins.GetInspectModel(weapon, skin)     -> 可预览的 3D Model（右侧大图用）
+-- ═══════════════════════════════════════════════════════════════
+S.SKIN_CN = {
+    ["Stock"] = "出厂",
+    ["Lore"] = "传说", ["Dragon Lore"] = "巨龙传说",
+    ["High Octane"] = "高辛烷", ["Beta"] = "测试版", ["Overdrive"] = "超速",
+    ["HexPop"] = "霓虹", ["Freedom"] = "自由", ["Metamorphosis"] = "蜕变",
+    ["Vampire"] = "血族", ["Bird Hunt"] = "猎鸟", ["Koi Pond"] = "锦鲤",
+    ["Railgun"] = "电磁炮", ["Tekko"] = "铁拳", ["Typhon"] = "堤丰",
+    ["Asiimov"] = "阿西莫夫", ["Hyper Beast"] = "野兽", ["Neo-Noir"] = "新黑色",
+    ["Printstream"] = "印花流", ["Fade"] = "渐变", ["Case Hardened"] = "表面淬火",
+    ["Doppler"] = "多普勒", ["Crimson Web"] = "深红之网", ["Slaughter"] = "屠杀",
+    ["Fire Serpent"] = "火蛇", ["Water Elemental"] = "水元素",
+    ["Frontside Misty"] = "迷雾", ["Point Disarray"] = "混沌点阵",
+    ["The Empress"] = "女皇", ["Bloodsport"] = "血搏",
+    ["Neon Revolution"] = "霓虹革命", ["Vulcan"] = "火神", ["Redline"] = "红线",
+    ["Cyrex"] = "赛瑞克斯", ["Guardian"] = "守护者", ["Atomic Alloy"] = "原子合金",
+    ["Mecha Industries"] = "机甲工业", ["Decimator"] = "毁灭者",
+    ["Golden Coil"] = "金蛇缠绕", ["Nightwish"] = "夜愿", ["Cortex"] = "皮层",
+    ["Chameleon"] = "变色龙", ["Emerald"] = "翡翠", ["Ruby"] = "红宝石",
+    ["Sapphire"] = "蓝宝石", ["Black Pearl"] = "黑珍珠",
+    ["Factory New"] = "工厂新", ["Minimal Wear"] = "略有磨损",
+    ["Field-Tested"] = "久经沙场", ["Well-Worn"] = "破损不堪",
+    ["Battle-Scarred"] = "战痕累累",
+}
+S.skinCN = function(name)
+    local n = tostring(name or "")
+    return S.SKIN_CN[n] or n
+end
+
+-- ⚠ 主 chunk 已经贴着 200 local 上限：这里必须挂 S 表，不能写 local
+-- （写 local 就是 "Out of local registers ... exceeded limit 200"，loadstring 直接返回 nil）
+S.RARITY_COLOR = {
+    Red = Color3.fromRGB(235, 75, 75),
+    Pink = Color3.fromRGB(215, 90, 215),
+    Purple = Color3.fromRGB(140, 100, 235),
+    Blue = Color3.fromRGB(90, 150, 235),
+    Gold = Color3.fromRGB(235, 190, 70),
+    Special = Color3.fromRGB(240, 170, 60),
+    Stock = Color3.fromRGB(160, 160, 160),
+}
+
+-- ═══════════════════════════════════════════════════════════════
+-- 真·换肤：hook Skins.GetCameraModel（不动 CurrentEquipped）
+--
+-- 游戏建 viewmodel 时走这一行（ReplicatedStorage.Classes.WeaponComponent.Classes.Viewmodel:936）：
+--   self.Model = Skins.GetCameraModel(CameraModelWeapon, self.Skin, self.Float, ...)
+-- 拦这个函数把第 2 个参数（skin）换掉，游戏就会用整套皮肤模型重建 ——
+-- 枪体、配件、贴图、图案一起换，而 CurrentEquipped 一个字都不动，
+-- 所以背包/拾取/购买完全不受影响（这是和「写属性换肤」的本质区别）。
+--
+-- 生效时机：下一次 viewmodel 重建。切换武器 / 换弹 / 重生都会触发。
+-- ═══════════════════════════════════════════════════════════════
+-- ═══════════════════════════════════════════════════════════════
+-- 【核心】劫持 CurrentEquipped 的读取，而不是跟服务端抢着写
+--
+-- 之前的错误做法：写属性 → 服务端立刻覆盖回 Stock → 白干。
+-- 正确做法：hook Instance.GetAttribute，当游戏（任何脚本）读
+-- LocalPlayer 的 "CurrentEquipped" 时，直接返回我们篡改过 Skin 的 JSON。
+--   · 服务端怎么覆盖都无所谓，因为读的时候永远拿到我们的值
+--   · 游戏自己的 Viewmodel → Skins → DecorateModel 渲染管线照常跑，
+--     所以出来的是**真皮肤**（模型/贴图/图案全套），不是贴膜
+--   · 不写任何数据、不碰背包、不碰 viewmodel 内部对象
+-- ═══════════════════════════════════════════════════════════════
+S.attrSkin = nil          -- 篡改后的 JSON 字符串
+S.attrHook = false
+S.origGetAttribute = nil
+
+S.installAttrHook = function()
+    if S.attrHook then return true end
+    if type(hookmetamethod) ~= "function" or type(getnamecallmethod) ~= "function" then
+        return false
+    end
+    local LP = game.Players.LocalPlayer
+    local orig
+    local ok, res = pcall(function()
+        local o
+        -- 用 __namecall 拦：hookfunction(Instance.GetAttribute, …) 在这个执行器上 hook 不动
+        -- （实测返回 false），但 hookmetamethod(game, "__namecall") 实测可用。
+        o = hookmetamethod(game, "__namecall", function(self, ...)
+            -- 快速路径：绝大多数调用不是 GetAttribute，直接放行（性能关键）
+            if getnamecallmethod() ~= "GetAttribute" then
+                return o(self, ...)
+            end
+            if S.attrSkin and self == LP then
+                local key = ...
+                if key == "CurrentEquipped" then
+                    return S.attrSkin
+                end
+            end
+            return o(self, ...)
+        end)
+        return o
+    end)
+    if not ok or type(res) ~= "function" then return false end
+    orig = res
+    S.origNamecall = orig
+    -- 读「真实值」用这个（绕过我们自己的 hook）
+    S.origGetAttribute = function(obj, key)
+        return orig(obj, key)
+    end
+    S.attrHook = true
+    return true
+end
+
+S.removeAttrHook = function()
+    if not S.attrHook then return true end
+    pcall(function()
+        if S.origNamecall then
+            hookmetamethod(game, "__namecall", S.origNamecall)
+        end
+    end)
+    S.attrHook = false
+    S.attrSkin = nil
+    return true
+end
+
+-- 设置要显示的皮肤（劫持读取 + 触发一次重建）
+S.setAttrSkin = function(skinName)
+    -- ⚠ 已废弃：这条路径会篡改 LocalPlayer 的 CurrentEquipped 属性（改「拥有什么」的语义），
+    -- 而主界面的美化走的是纯本地渲染（S.paintCurrentModel + GetCameraModel hook），不需要它。
+    -- 保留函数名只做短路，避免可能有残留调用点报 nil。
+    do return false, "已废弃：请用 S.paintCurrentModel（纯本地，不改属性）" end
+    local lp = game.Players.LocalPlayer
+    local HS = game:GetService("HttpService")
+    -- ⚠ 必须用原始 GetAttribute 读，否则读到的是我们自己篡改过的值
+    local raw
+    if S.attrHook and S.origGetAttribute then
+        raw = S.origGetAttribute(lp, "CurrentEquipped")
+    else
+        raw = lp:GetAttribute("CurrentEquipped")
+    end
+    if type(raw) ~= "string" then
+        -- 手上没枪时也允许预设：等有装备时再生效
+        return false, "现在没有手持装备（进回合后再点）"
+    end
+    local ok, cur = pcall(function() return HS:JSONDecode(raw) end)
+    if not ok or type(cur) ~= "table" then return false, "解析 CurrentEquipped 失败" end
+    cur.Skin = tostring(skinName)
+    local ok2, enc = pcall(function() return HS:JSONEncode(cur) end)
+    if not ok2 then return false, "编码失败" end
+
+    if not S.installAttrHook() then return false, "执行器不支持 hookfunction" end
+    S.attrSkin = enc
+    S.skinPaint[tostring(cur.Name)] = tostring(skinName)
+    cfg.skinAutoName = tostring(skinName)
+    cfg.skinAutoPaint = true
+
+    -- 触发一次属性变化，让游戏重建 viewmodel（重建时读到的就是篡改值）
+    pcall(function() lp:SetAttribute("CurrentEquipped", enc) end)
+    return true, string.format("%s → %s（已劫持读取，服务端覆盖无效）",
+        tostring(cur.Name), tostring(skinName))
+end
+
+-- ⚠ 这里曾经有一份「installSkinHook v1」：用 GetInspectModel 取一张贴图，
+-- 直接写返回值模型的 TextureID。实测这条路会让部分枪直接消失 / 材质错乱，
+-- 而且没有幂等保护 —— 重载后会在游戏模块上叠第二层 wrapper，
+-- 卸载只能还原最后一层，皮肤表还想继续生效。
+-- 已整段删除。生效实现只有文件尾部那一个（带 _mv_orig 标记 + return true）。
+
+-- 立刻把皮肤贴图刷到「当前已经建好的 viewmodel」上（不用等切枪）。
+-- hook 那条只保证「以后每次重建都带皮肤」，这个负责「现在这一刻就变」。
+-- 皮肤只刷「枪身」部件：手臂/手套/锚点一律跳过。
+-- 之前把 Right Arm / Left Arm / Glove 也刷了 → 手背上一块皮肤贴图（用户："给我手臂贴膜"）。
+S.SKIN_SKIP = {
+    ["Right Arm"] = true, ["Left Arm"] = true, ["Glove"] = true,
+    ["HumanoidRootPart"] = true, ["ViewmodelLight"] = true, ["MuzzlePart"] = true,
+}
+
+-- 读 SurfaceAppearance.ColorMap
+-- ⚠ 必须切到 thread identity 7：identity 8 下读写都会被拒
+-- （"lacking capability Plugin"）。gethiddenproperty 在 8 下同样失效。
+-- 这里自带一份完整实现（不依赖后面的 S.saGet），因为本函数在文件前部就可能被调用。
+S.getColorMap = function(sa)
+    if not sa then return nil end
+    local can = (type(setthreadidentity) == "function")
+    if can then pcall(setthreadidentity, 7) end
+    local ok, v = pcall(function() return sa.ColorMap end)
+    if (not ok or v == nil) and type(gethiddenproperty) == "function" then
+        local ok2, v2 = pcall(gethiddenproperty, sa, "ColorMap")
+        if ok2 and v2 ~= nil then ok, v = true, v2 end
+    end
+    if can then pcall(setthreadidentity, 8) end
+    if ok then return v end
+    return nil
+end
+
+-- ⚠ 这里曾经是 paintCurrentModel v0（sk:FindFirstChild(d.Name, true) + Instance.new("SurfaceAppearance")）。
+-- 实测这条路：递归找到的同名对象往往没有 SA → painted=0；新建 SA 写不进去 → 枪不变色。
+-- 已整段删除。生效实现只有文件尾部那个（按名字建材质表，只写现有 SA，绝不新建/销毁）。
+
+-- ⚠ 皮肤选择必须跨重载保留，而且不能预设默认皮肤。
+--
+-- 老实现是 `S.skinPaint = { ["AK-47"] = "Aniki" }`：
+--   · 任何人一加载就被强行给 AK 换皮（哪怕他从没选过）；
+--   · 点别的皮肤只改这张内存表，重载后回到 AK-47=Aniki —— 选择等于丢失。
+--
+-- ⚠ 不要用 __newindex 元表做"自动落盘"：那个钩子只在「键原本不存在」时触发，
+-- 同一把枪换第二次皮肤（键已存在）根本不触发，删键（赋 nil）也不触发 ——
+-- 实测下来落盘表会停在第一次写入的值上，比不保存更难查。所以改成显式保存。
+S.skinPaint = {}
+do
+    local store = getgenv().MV_SKIN_SAVE
+    if type(store) == "table" then
+        for k, v in pairs(store) do S.skinPaint[k] = v end
+    else
+        getgenv().MV_SKIN_SAVE = {}
+    end
+end
+
+-- 把当前皮肤表整体写回 getgenv（跨重载保留；不落文件，重进服务器会丢）
+S.saveSkins = function()
+    local out = {}
+    for k, v in pairs(S.skinPaint) do out[k] = v end
+    getgenv().MV_SKIN_SAVE = out
+    return out
+end
+
+-- 统一入口：读改写都走这里，避免再漏一个赋值点
+S.setSkin = function(weaponName, skinName)
+    -- ★ 面板卡片的真正入口就是这里（openSkinPanel 的卡片回调调的是 S.setSkin，
+    --   不是 S.applySkinPaint）。点的是「另一把刀」时，必须把当前手持映射过去，
+    --   否则 skinPaint 写进去了、但手上那把刀根本没换 → 用户看到「绿色选中了却没反应」。
+    do
+        local hw = S.getCurrentWeapon and S.getCurrentWeapon()
+        if hw and hw.Name then
+            local held, want = tostring(hw.Name), tostring(weaponName)
+            if held ~= want and type(S.meleeSwap) == "table" then
+                local node = RS.Database.Custom.Weapons:FindFirstChild(want)
+                local okCfg, cfgW = false, nil
+                if node then okCfg, cfgW = pcall(function() return require(node) end) end
+                if okCfg and type(cfgW) == "table" and tostring(cfgW.Class) == "Melee" then
+                    S.meleeSwap[held] = want
+                    cfg.meleeSwapOn = true
+                    S.meleeAutoMapped = (S.meleeAutoMapped or 0) + 1
+                end
+            end
+        end
+    end
+    local wn = tostring(weaponName)
+    if skinName == nil then
+        S.skinPaint[wn] = nil
+    else
+        S.skinPaint[wn] = tostring(skinName)
+    end
+    -- ⚠ 重新点一次皮肤 = 明确的「再试一次」信号，必须清掉这把枪+这款皮肤的熔断计数。
+    -- 不清的话：连续 3 次写不进 → 轮询每次在熔断检查处直接 return →
+    -- 后面「恢复正常就清零」的分支永远走不到 → 同一把枪同一款皮肤再也不会重试，
+    -- 只能重载脚本才清状态。
+    if skinName ~= nil and type(S._skinFail) == "table" then
+        S._skinFail[wn .. "|" .. tostring(skinName)] = 0
+    end
+    -- ⚠⚠ 关键：把皮肤同步到游戏自己持有的装备对象上。
+    --
+    -- InventoryController.getCurrentEquipped() 返回的 table 里有 Name / Skin / Slot 等字段，
+    -- 游戏的 viewmodel 就是按 item.Skin 构建的（实测改之前 Skin="Stock"）。
+    -- 我们之前只改 viewmodel 上的 SurfaceAppearance，游戏并不知道，所以：
+    --   · 材质写进去了、读回也是新值，但引擎对已存在的 SA 不重绘 → 画面不变
+    --   · 一旦游戏重建 viewmodel（换枪/死亡/回合开始），又按 item.Skin 变回原皮
+    -- 直接把字段改掉，重建时拿到的就是我们要的皮肤。
+    --
+    -- 注意：改字段本身不会立刻刷新画面（equip 对当前武器是空操作），
+    -- 需要切一次枪才会重建 —— 这是游戏机制，不是脚本问题。
+    pcall(function()
+        local RS2 = game:GetService("ReplicatedStorage")
+        local ic = require(RS2.Controllers.InventoryController)
+        -- ★ 只用 peek：getCurrentEquipped 的原函数体内是 getfenv 执行器检测，
+        --   哪怕 patch 万一失效一次，也会把 u0 清空（整个武器创建链永久失效）。
+        --   peek 没有任何调用栈检查，返回的是同一个 CurrentEquipped 对象。
+        local peek = ic.peekCurrentEquippedForMovement or ic.getCurrentEquipped
+        local cur = peek and peek()
+        if cur and tostring(cur.Name) == wn then
+            cur.Skin = tostring(skinName or "Stock")
+            S.itemSkinSynced = tostring(wn) .. "→" .. tostring(cur.Skin)
+        end
+    end)
+    -- 部件列表缓存也作废：用户刚换了皮肤，下一轮立刻重新扫一遍目标模型
+    S._skinParts = nil
+    S.saveSkins()
+    return S.skinPaint[wn]
+end
+S.skinOverride = {}
+S.applySkinPaint = function(weaponName, skinName)
+    -- ★ 面板里点的如果是「另一把刀」，就把当前手持映射到它。
+    --
+    -- 不加这一步的后果（实测）：用户在面板选了 Butterfly Knife 的 Fade，
+    -- 皮肤只写进 S.skinPaint["Butterfly Knife"]，而 applyMeleeSwap 找的是
+    -- S.meleeSwap[当前手持]，两边对不上 → 手上永远是原来那把刀 + 皮肤永远 Stock。
+    -- 表现就是「AI 手动换能换，我在面板点就是没反应」。
+    do
+        local hw = S.getCurrentWeapon and S.getCurrentWeapon()
+        if hw and hw.Name then
+            local held, want = tostring(hw.Name), tostring(weaponName)
+            if held ~= want and type(S.meleeSwap) == "table" then
+                local node = RS.Database.Custom.Weapons:FindFirstChild(want)
+                local okCfg, cfgW = false, nil
+                if node then okCfg, cfgW = pcall(function() return require(node) end) end
+                if okCfg and type(cfgW) == "table" and tostring(cfgW.Class) == "Melee" then
+                    S.meleeSwap[held] = want
+                    cfg.meleeSwapOn = true
+                    S.meleeAutoMapped = (S.meleeAutoMapped or 0) + 1
+                end
+            end
+        end
+    end
+    if not S.installSkinHook() then return false, "皮肤库不可用" end
+    -- ⚠⚠ 先验证这款皮肤在这把枪上**真的存在**。
+    --
+    -- 不验证的后果：skinPaint 被写成一把枪根本没有的皮肤（比如给 Glock 设 "Lore"，
+    -- 而 Lore 是 AK 的皮肤），轮询每 0.12 秒都去 getSkinSAMap 找 → 永远空 →
+    -- 一个部件都不写 → 画面停在上一次成功的皮肤上，再也换不掉。
+    -- 用户看到的就是「美化被固定住了」。
+    local probe, why = S.getSkinSAMap(tostring(weaponName), tostring(skinName), nil)
+    if not probe or next(probe) == nil then
+        local root = S.getSkinsRoot()
+        local wf = root and root:FindFirstChild(tostring(weaponName))
+        local avail = {}
+        if wf then
+            for _, c in ipairs(wf:GetChildren()) do
+                if c:IsA("Folder") then avail[#avail + 1] = c.Name end
+            end
+        end
+        return false, string.format("%s 没有皮肤 %s（可用：%s）",
+            tostring(weaponName), tostring(skinName),
+            #avail > 0 and table.concat(avail, ", ") or "无")
+    end
+    S.setSkin(weaponName, skinName)
+    cfg.skinAutoName = tostring(skinName)
+    cfg.skinAutoPaint = true
+    -- 立刻刷当前模型（不等切枪）
+    local n = S.paintCurrentModel(tostring(weaponName), tostring(skinName))
+    -- ⚠ 区分两种「0 部件」：
+    --   ① 现在没拿着这把枪 → paintCurrentModel 找不到 viewmodel，返回 0；
+    --      皮肤已经记进 S.skinPaint，切到它时 GetCameraModel hook 会自己套上，算成功。
+    --   ② 正拿着、但一个 MeshPart 都没匹配上（没有同名部件 / 没有现成 SurfaceAppearance /
+    --      SA 带 TexturePackContent 写不进去）→ 这才是真失败，不能报「已立即刷 0 个部件」。
+    -- ⚠ 判断「是否真的拿在手里」不能用 cam:FindFirstChild(weaponName)。
+    -- 游戏会把不用的武器 viewmodel 留在 workspace.Camera 里（或 ViewmodelStash），
+    -- 于是「拿着 Glock、点 AK 的皮肤」也会被当成手持 → paintCurrentModel 返回 0 → 卡片标红，
+    -- 而实际上皮肤已经记进 S.skinPaint，切到 AK 时会自动生效。
+    -- 这里改成和 InventoryController 报告的当前武器比对。
+    local cur = S.getCurrentWeapon and S.getCurrentWeapon()
+    local actuallyHeld = cur ~= nil and tostring(cur.Name) == tostring(weaponName)
+    if not actuallyHeld then
+        return true, string.format("%s → %s（已记录，切到这把枪时生效）",
+            tostring(weaponName), tostring(skinName))
+    end
+    if n <= 0 then
+        return false, string.format(
+            "%s → %s：这把枪没有可替换的材质部件（需要同名 MeshPart + 现成 SurfaceAppearance）",
+            tostring(weaponName), tostring(skinName))
+    end
+    return true, string.format("%s → %s（已立即刷 %d 个部件）",
+        tostring(weaponName), tostring(skinName), n)
+end
+
+-- ⚠ 强制让游戏重建 viewmodel。
+--
+-- 为什么需要：SurfaceAppearance 的属性写进去、读回也是新值，但引擎对**已存在**的 SA
+-- 不重绘（实测改完 1 秒读回值仍是新的、画面一点不变）。轮询也救不了 ——
+-- 它每 0.12 秒检查一次，发现 ColorMap 已经等于目标值就不再写，画面就停在旧材质上。
+-- 用户看到的就是「换皮肤没反应 / 换了又变回去 / 只有第一次生效」。
+--
+-- 把 viewmodel 从 Camera 上摘下来再挂回去，游戏会重新走 GetCameraModel 构建一次，
+-- 而我们的 hook 在模型交回游戏前就把 SA 换成皮肤模板的克隆 → 这次是全新的 SA 实例，
+-- 引擎必然重建材质。
+S.rebuildViewmodel = function(weaponName)
+    local cam = workspace.CurrentCamera
+    if not cam then return false, "no-camera" end
+    local vm = cam:FindFirstChild(tostring(weaponName))
+    if not vm then return false, "not-held" end
+    local parent = vm.Parent
+    if not parent then return false, "no-parent" end
+    vm.Parent = nil
+    task.defer(function()
+        pcall(function() vm.Parent = parent end)
+    end)
+    S.rebuilds = (S.rebuilds or 0) + 1
+    return true
+end
+
+S.clearSkinPaint = function()
+    -- 不能在遍历中直接删除（pairs 里置 nil 会跳项），先收集 key。
+    local keys = {}
+    for k in pairs(S.skinPaint) do keys[#keys + 1] = k end
+    for _, k in ipairs(keys) do S.skinPaint[k] = nil end
+    S.saveSkins()   -- 整体落盘（清空后的表）
+    return true, "已清除皮肤（切一次枪还原）"
+end
+
+S.applySkinReal = function(skinName)
+    local w = S.getCurrentWeapon()
+    if not w then return false, "没有手持武器" end
+    return S.applySkinPaint(tostring(w.Name), tostring(skinName))
+end
+
+S.clearSkinReal = function()
+    return S.clearSkinPaint()
+end
+
+-- ═══════════════════════════════════════════════════════════════
+-- 真·换肤（写属性版）—— 唯一能让「枪体」变的方式
+--
+-- 前面试过的两条路都不行，实测结论：
+--   1) 改 MeshPart.TextureID：只能改到配件和手套（手套是标准 MeshPart），
+--      枪体是 Part / 空贴图 MeshPart，改不到。
+--   2) hook Skins.GetCameraModel：Stock 和任意皮肤返回的模型、MeshId、TextureID
+--      **完全一样**（实测 sig 对比 不同=false），皮肤是在 DecorateModel /
+--      GetSkinTextureFolder 里套的，那两个是模块内局部函数，从外面 hook 不到。
+--
+-- 所以只剩写 CurrentEquipped.Skin：游戏会读它重建整套 viewmodel，枪体一起换。
+-- 代价是服务端背包同步会冲突（买东西不进、捡的消失、主武器切不出来），
+-- 必须重进服务器恢复。这里给原始 JSON 做了备份，随时可以还原。
+-- ═══════════════════════════════════════════════════════════════
+S.skinWriteBackup = {}
+
+S.applySkinWrite = function(skinName)
+    local lp = game.Players.LocalPlayer
+    local HS = game:GetService("HttpService")
+    local raw = lp:GetAttribute("CurrentEquipped")
+    if type(raw) ~= "string" then return false, "没有手持武器" end
+    local ok, cur = pcall(function() return HS:JSONDecode(raw) end)
+    if not ok or type(cur) ~= "table" then return false, "解析 CurrentEquipped 失败" end
+    -- 备份原始 JSON（同一把枪只备份第一次）
+    if not S.skinWriteBackup[tostring(cur.Name)] then
+        S.skinWriteBackup[tostring(cur.Name)] = raw
+    end
+    cur.Skin = tostring(skinName)
+    -- ⚠ 绝对不要改 _id。
+    -- 老情报里写的是 `cur._id = "AWP_Lore"`（Name_Skin 格式），但现在实测 _id 是
+    -- **物品实例 UUID**（例如 d700f34a-3f0e-4daf-b4ff-31c293c0f63e）。
+    -- 改成 Name_Skin 游戏会认不出这个物品，属性被立刻覆盖成 T Knife（实测 after write = T Knife）。
+    -- 皮肤只需要 Skin 字段，_id 保持原样。
+    local ok2, enc = pcall(function() return HS:JSONEncode(cur) end)
+    if not ok2 then return false, "编码失败" end
+    local ok3 = pcall(function() lp:SetAttribute("CurrentEquipped", enc) end)
+    if not ok3 then return false, "写属性失败" end
+    cfg.skinAutoName = tostring(skinName)
+    -- 打开自动重放：换枪时把皮肤重新写上去（否则换枪就退回原皮肤）
+    cfg.skinAutoPaint = true
+    return true, string.format("%s → %s（切一次枪生效；背包会错乱，重进服务器恢复）",
+        tostring(cur.Name), tostring(skinName))
+end
+
+S.restoreSkinWrite = function()
+    local lp = game.Players.LocalPlayer
+    -- ⚠ 必须先关掉自动重放，否则还原完 0.35 秒后监听又把皮肤写回去（实测踩过）
+    cfg.skinAutoPaint = false
+    cfg.skinAutoName = "Stock"
+    local n = 0
+    for name, raw in pairs(S.skinWriteBackup or {}) do
+        local ok = pcall(function() lp:SetAttribute("CurrentEquipped", raw) end)
+        if ok then n = n + 1 end
+    end
+    S.skinWriteBackup = {}
+    return n > 0, string.format("已还原 %d 把枪的原始数据（切一次枪生效）", n)
+end
+
+-- ═══════════════════════════════════════════════════════════════
+-- 换肤（组件版）—— 改 w.Skin / vm.Skin，不碰 CurrentEquipped
+--
+-- 为什么这条路才对：
+--   Viewmodel 构造时用的是 `self.Skin`（viewmodel 实例自己的字段），
+--   而 CurrentEquipped 是服务端下发的装备数据，服务端会把它覆盖回 Stock
+--   （实测：写属性后属性保持，但游戏重建回原模型 —— 截图里就是黑的）。
+--   w.Skin / vm.Skin 是纯客户端对象字段，服务端完全不知道，也不会覆盖。
+--
+-- 生效方式：改完字段后尝试调重建方法（construct/rebuild/…）；
+-- 没有可调方法时就切一次枪，游戏自己会按新字段重建。
+-- ═══════════════════════════════════════════════════════════════
+S.applySkinComponent = function(skinName)
+    local ic = getInvCtrl()
+    if not ic then return false, "没有 InventoryController" end
+    local ok, w = pcall(function() return ic.peekCurrentEquippedForMovement() end)
+    if not ok or not w then return false, "没有手持武器实例（可能还没上膛/在买枪阶段）" end
+    local vm = w.Viewmodel
+    if not vm then return false, "这把武器还没有 viewmodel" end
+
+    pcall(function() w.Skin = tostring(skinName) end)
+    pcall(function() vm.Skin = tostring(skinName) end)
+    cfg.skinAutoName = tostring(skinName)
+
+    -- ⚠ 绝对不要在这里调 vm:destroy()。
+    -- 实测：destroy 会清掉 construct 依赖的内部对象（CharacterAnimator 等），
+    -- 之后 construct 永远报 `attempt to index nil with 'stopAnimations'`，
+    -- 连游戏自己的 unequip 也跟着报错，viewmodel 直接坏掉，只能切枪/重生恢复。
+    -- 所以这里只改字段，让「游戏自己」在下一次 construct 时用新 Skin。
+    return true, string.format("%s → %s（字段已设，切一次枪让游戏自己重建）", tostring(w.Name), tostring(skinName))
+end
+
+S.openSkinBrowser = function()
+    -- ⚠ 已废弃：这是旧的皮肤浏览器入口，内部会调 setAttrSkin 改 CurrentEquipped。
+    -- 主界面现在用 S.openSkinPanel()（纯本地渲染 + 图片网格）。
+    do return false, "已废弃：请用 S.openSkinPanel()" end
+    -- ⚠ Window 是文件末尾才创建的，本函数定义在前面 —— 直接写 Window:Notify 会崩
+    -- （实测：attempt to index nil with 'Notify'，注入时自动弹面板整段中断）。
+    -- 统一走这个安全包装：Window 没建好就退化成 warn。
+    local function notify(t)
+        local ok = pcall(function() Window:Notify(t) end)
+        if not ok then
+            warn("[SKIN] " .. tostring(t and t.Title) .. ": " .. tostring(t and t.Description))
+        end
+    end
+    local cur = S.getCurrentWeapon()
+    if not cur then
+        notify({ Title = "美化", Description = "手上没有武器（或装备数据异常），换一次枪再试", Lifetime = 5 })
+        return
+    end
+    local lib = S.getSkinsLib()
+    if not lib then return end
+    local okL, list = pcall(lib.GetAllSkinsForWeapon, tostring(cur.Name))
+    if not okL or type(list) ~= "table" or #list == 0 then
+        notify({ Title = "美化", Description = "该武器没有皮肤", Lifetime = 3 })
+        return
+    end
+
+    local holder = (gethui and gethui()) or game:GetService("CoreGui")
+    local old = holder:FindFirstChild("MV_SkinBrowser")
+    if old then old:Destroy() end
+
+    local sg = Instance.new("ScreenGui")
+    sg.Name = "MV_SkinBrowser"
+    sg.ResetOnSpawn = false
+    sg.IgnoreGuiInset = true
+    sg.DisplayOrder = 50
+    local okp = pcall(function() sg.Parent = holder end)
+    if not okp then sg.Parent = game.Players.LocalPlayer:WaitForChild("PlayerGui") end
+
+    local frame = Instance.new("Frame")
+    frame.Size = UDim2.new(0, 720, 0, 460)
+    frame.Position = UDim2.new(0.5, -360, 0.5, -230)
+    frame.BackgroundColor3 = Color3.fromRGB(16, 18, 24)
+    frame.BorderSizePixel = 0
+    frame.Active = true
+    frame.Parent = sg
+    local stroke = Instance.new("UIStroke")
+    stroke.Color = Color3.fromRGB(80, 110, 150); stroke.Thickness = 1; stroke.Parent = frame
+
+    local title = Instance.new("TextLabel")
+    title.Size = UDim2.new(1, -60, 0, 34)
+    title.BackgroundTransparency = 1
+    title.Font = Enum.Font.GothamBold
+    title.TextSize = 15
+    title.TextColor3 = Color3.fromRGB(120, 210, 255)
+    title.TextXAlignment = Enum.TextXAlignment.Left
+    title.Text = string.format("  美化 · %s（%d 个皮肤，点击应用，纯本地）", tostring(cur.Name), #list)
+    title.Parent = frame
+
+    local close = Instance.new("TextButton")
+    close.Size = UDim2.new(0, 34, 0, 34)
+    close.Position = UDim2.new(1, -40, 0, 0)
+    close.BackgroundColor3 = Color3.fromRGB(120, 40, 45)
+    close.BorderSizePixel = 0
+    close.Font = Enum.Font.GothamBold
+    close.TextSize = 17
+    close.TextColor3 = Color3.fromRGB(255, 235, 235)
+    close.Text = "×"
+    close.Parent = frame
+    close.MouseButton1Click:Connect(function() sg:Destroy() end)
+
+    -- 皮肤网格（缩略图 + 中文名）：整块宽度，不再留右侧预览（卡片图已经能看，
+    -- 3D 预览纯占地方，用户明确说没必要）
+    local grid = Instance.new("ScrollingFrame")
+    grid.Size = UDim2.new(1, -20, 1, -50)
+    grid.Position = UDim2.new(0, 10, 0, 40)
+    grid.BackgroundTransparency = 1
+    grid.BorderSizePixel = 0
+    grid.ScrollBarThickness = 5
+    grid.CanvasSize = UDim2.new(0, 0, 0, 0)
+    grid.AutomaticCanvasSize = Enum.AutomaticSize.Y
+    grid.Parent = frame
+    local layout = Instance.new("UIGridLayout")
+    layout.CellSize = UDim2.new(0, 168, 0, 120)
+    layout.CellPadding = UDim2.new(0, 6, 0, 6)
+    layout.Parent = grid
+
+    for _, item in ipairs(list) do
+        local skin = tostring(item.skin or "?")
+        local card = Instance.new("TextButton")
+        card.BackgroundColor3 = Color3.fromRGB(26, 30, 38)
+        card.BorderSizePixel = 0
+        card.AutoButtonColor = true
+        card.Text = ""
+        card.Parent = grid
+
+        local img = Instance.new("ImageLabel")
+        img.Size = UDim2.new(1, -8, 0, 66)
+        img.Position = UDim2.new(0, 4, 0, 4)
+        img.BackgroundColor3 = Color3.fromRGB(20, 22, 28)
+        img.BorderSizePixel = 0
+        img.ScaleType = Enum.ScaleType.Fit
+        local tex
+        pcall(function() tex = lib.GetWearImageForFloat(item, 0.01) end)
+        if type(tex) == "string" then img.Image = tex end
+        img.Parent = card
+
+        local nameLbl = Instance.new("TextLabel")
+        nameLbl.Size = UDim2.new(1, -8, 0, 16)
+        nameLbl.Position = UDim2.new(0, 4, 0, 72)
+        nameLbl.BackgroundTransparency = 1
+        nameLbl.Font = Enum.Font.GothamMedium
+        nameLbl.TextSize = 11
+        nameLbl.TextXAlignment = Enum.TextXAlignment.Left
+        nameLbl.TextTruncate = Enum.TextTruncate.AtEnd
+        nameLbl.TextColor3 = S.RARITY_COLOR[item.rarity] or Color3.fromRGB(210, 215, 225)
+        nameLbl.Text = S.skinCN(skin)
+        nameLbl.Parent = card
+
+        local subLbl = Instance.new("TextLabel")
+        subLbl.Size = UDim2.new(1, -8, 0, 14)
+        subLbl.Position = UDim2.new(0, 4, 0, 88)
+        subLbl.BackgroundTransparency = 1
+        subLbl.Font = Enum.Font.Gotham
+        subLbl.TextSize = 9
+        subLbl.TextXAlignment = Enum.TextXAlignment.Left
+        subLbl.TextTruncate = Enum.TextTruncate.AtEnd
+        subLbl.TextColor3 = Color3.fromRGB(140, 150, 165)
+        subLbl.Text = string.format("%s · %s", skin, tostring(item.rarity or "?"))
+        subLbl.Parent = card
+
+        card.MouseButton1Click:Connect(function()
+            -- 点卡片 = 装皮肤（hook GetCameraModel 刷贴图，不碰任何数据）。
+            -- 立即生效不了 —— 要等游戏下次构建 viewmodel（切枪/重生/换弹）。
+            cfg.skinAutoName = skin
+            -- 走「劫持读取」这条路：游戏重建 viewmodel 时读到的是带皮肤的 JSON，
+            -- 由游戏自己的 DecorateModel 渲染真皮肤，服务端覆盖无效。
+            local okA, msg = S.setAttrSkin(skin)
+            for _, ch in ipairs(grid:GetChildren()) do
+                if ch:IsA("TextButton") then ch.BackgroundColor3 = Color3.fromRGB(26, 30, 38) end
+            end
+            card.BackgroundColor3 = Color3.fromRGB(40, 70, 50)
+            notify({
+                Title = okA and ("已装皮肤: " .. S.skinCN(skin)) or "失败",
+                Description = tostring(msg),
+                Lifetime = 4,
+            })
+        end)
+    end
+
+    return sg
+end
+
+
 S.applySkin = function(skinName)
+    -- 写了属性会破坏背包，所以只做视觉。想强行写属性：cfg.skinWriteAttr = true（后果自负）
+    local okVis, msg = S.applySkinVisual(skinName)
+    if okVis then return true, msg end
     if cfg.skinWriteAttr ~= true then
         return false, "换肤已禁用（会破坏背包同步，见代码注释）"
     end
@@ -4350,7 +6376,31 @@ S.findSites = function()
     return out
 end
 
-S.siteLabels = {}
+-- ⚠ 标签表必须放到 getgenv 里共享。
+-- 重载时新实例的 S 是一张全新的空表，旧实例丢下的 Drawing 对象不在里面；
+-- 卸载时遍历 S.siteLabels 清不到它们 —— 那两个 A pt / B pt 就永久焊在屏幕上，
+-- 跟着视角走（它们是屏幕坐标的 Drawing.Text）。用户实测就是这个现象。
+S.siteLabels = getgenv().MV_SITE_LABELS
+if type(S.siteLabels) ~= "table" then
+    S.siteLabels = {}
+    getgenv().MV_SITE_LABELS = S.siteLabels
+end
+
+-- 彻底销毁包点标签（卸载 / 关闭时都走这里）
+S.sitesClear = function()
+    local n = 0
+    for k, rec in pairs(S.siteLabels or {}) do
+        if rec and rec.obj then
+            pcall(function() rec.obj.Visible = false end)
+            local ok = pcall(function() rec.obj:Remove() end)
+            if not ok then pcall(function() rec.obj:Destroy() end) end
+            rec.obj = nil
+            n = n + 1
+        end
+        S.siteLabels[k] = nil
+    end
+    return n
+end
 
 S.updateSites = function(dt)
     -- 每 5 秒重新扫一次（换图 / 地图重载时能跟上）
@@ -4402,7 +6452,7 @@ S.updateSites = function(dt)
                 if onScreen and sp.Z > 0 then
                     local dist = (pos - my.Position).Magnitude
                     rec.obj.Position = Vector2.new(sp.X, sp.Y)
-                    rec.obj.Text = string.format("%s 点   %dm", k, math.floor(dist))
+                    rec.obj.Text = string.format("%s pt   %dm", k, math.floor(dist))
                     rec.obj.Color = (k == "A") and Color3.fromRGB(255, 150, 60) or Color3.fromRGB(80, 200, 255)
                     rec.obj.Visible = true
                 else
@@ -4852,7 +6902,32 @@ S.updateBomb = function(dt)
     local timeText = string.format("%02d:%02d", m, s)
     -- 拆包需要的时间也标出来，方便判断「还来不来得及」
     local kitText = hasKit and "5s" or "10s"
-    obj.Text = string.format("💣 %s   %s   %s", timeText, canDefuse and "可拆" or "拆不掉", kitText)
+
+    -- 拆包进行中：服务端在 Player 上写 DefuseStartTime，配合 GetServerTimeNow 可以算真实剩余。
+    -- 数据来源（反编译 Middle.DefuseBomb，第 223 行）：
+    --     self.DefuseTime = if not self.HasDefuseKit then 10 else 5
+    --     v2 = Player:GetAttribute("DefuseStartTime")
+    --     v3 = workspace:GetServerTimeNow() - v2
+    -- 谁在拆就读谁，不一定是本地玩家。
+    local defuseText = ""
+    local okP, players = pcall(function() return game.Players:GetPlayers() end)
+    if okP and players then
+        for _, p in ipairs(players) do
+            local ds = p:GetAttribute("DefuseStartTime")
+            if typeof(ds) == "number" then
+                local kit2 = p:GetAttribute("HasDefuseKit") == true
+                local need2 = kit2 and 5 or 10
+                local elapsed = workspace:GetServerTimeNow() - ds
+                local remain = need2 - elapsed
+                if remain > 0 and remain <= need2 + 1 then
+                    defuseText = string.format("   DEF %s %.1fs", tostring(p.Name):sub(1, 10), remain)
+                end
+                break
+            end
+        end
+    end
+
+    obj.Text = string.format("[C4] %s   %s   %s%s", timeText, canDefuse and "OK" or "NO", kitText, defuseText)
     obj.Color = canDefuse and Color3.fromRGB(120, 255, 140) or Color3.fromRGB(255, 90, 90)
     obj.Position = Vector2.new(vp.X * 0.5, vp.Y * 0.12)
     obj.Visible = true
@@ -5069,7 +7144,23 @@ S.noRecoilHook = function()
     local ok, CC = pcall(require, game.ReplicatedStorage.Controllers.CameraController)
     if not ok or type(CC) ~= "table" then return false end
 
-    -- ① setWeaponRecoil —— 只设**目标**（内部是 u131:setGoal）
+    -- 自动压枪的比例：返回「还剩多少」的系数（1 = 原样灌进去，0 = 完全不灌）
+    -- ⚠ 必须在**源头**缩放，不能事后补相机：
+    --   weaponKick 内部是三个弹簧
+    --       u121:setPosition(a1.Value * 0.017453)   ← 只有这个有 getter（getWeaponKickRotation）
+    --       u126:setPosition(a2.Value)              ← 直接设，**没有任何 getter 能读到**
+    --       u0.updateCamera()
+    --   相机最终偏移 = 三者合成。只补 u121 的话，u126 那部分永远补不到 ——
+    --   实测 kick 只有 0.86°，相机 pitch 却摆了 3.59°，差额就是它。
+    local function compScale()
+        if cfg.autoRecoilComp ~= true or cfg.noRecoil == true then return 1, 1 end
+        local kv = math.clamp((tonumber(cfg.recoilCompV) or tonumber(cfg.recoilCompPercent) or 0) / 100, 0, 1)
+        local kh = math.clamp((tonumber(cfg.recoilCompH) or tonumber(cfg.recoilCompPercent) or 0) / 100, 0, 1)
+        return 1 - kv, 1 - kh
+    end
+    S.recoilCompScale = compScale
+
+    -- ① setWeaponRecoil —— 设后座**目标**（u131:setGoal），弹簧会向它逼近
     local orig = getgenv().MV_ORIG_SETRECOIL
     if typeof(orig) ~= "function" then
         orig = CC.setWeaponRecoil
@@ -5080,27 +7171,16 @@ S.noRecoilHook = function()
             S.recoilBlocked = (S.recoilBlocked or 0) + 1
             return
         end
+        local sx, sy = compScale()
+        if (sx ~= 1 or sy ~= 1) and type(tbl) == "table" and typeof(tbl.Value) == "Vector3" then
+            tbl = { Value = Vector3.new(tbl.Value.X * sx, tbl.Value.Y * sy, tbl.Value.Z),
+                    Damper = tbl.Damper, Speed = tbl.Speed }
+            S.recoilScaled = (S.recoilScaled or 0) + 1
+        end
         return orig(tbl, scale, ...)
     end
 
-    -- ② weaponKick —— ⚠⚠ 这才是真正把后座「立即」写进相机的那一个
-    --
-    -- 实测（docId 170 第 541 行）：
-    --     function u0.weaponKick(a1, a2)
-    --         u121:setDampingRatio(a1.Damper)
-    --         u121:setFrequency(a1.Speed)
-    --         u121:setPosition(a1.Value * 0.017453292519943295)   ← 直接设当前值！
-    --         u126:setDampingRatio(a2.Damper)
-    --         u126:setFrequency(a2.Speed)
-    --         ...
-    --     end
-    -- 而 getWeaponKickRotation() 返回的就是 u121:getPosition()。
-    --
-    -- 所以只拦 setWeaponRecoil（setGoal）根本没用：目标没被设，但每发子弹
-    -- weaponKick 直接 setPosition 把弹簧顶起来 → 相机照样跳。
-    -- 用户看到的「子弹是无后座了，但准星乱飞」就是这个 —— 拦截点找错了。
-    -- 实测证据：setWeaponRecoil 已被拦 122,397 次，手动调一次 weaponKick
-    -- 就能把 kick 从 (0,0,0) 顶到 (0.023, 0.008, 0)，0.6 秒后才自然衰减。
+    -- ② weaponKick —— 直接 setPosition（u121 弧度 / u126 原值）
     local origKick = getgenv().MV_ORIG_WEAPONKICK
     if typeof(origKick) ~= "function" then
         origKick = CC.weaponKick
@@ -5111,6 +7191,18 @@ S.noRecoilHook = function()
             S.recoilKickBlocked = (S.recoilKickBlocked or 0) + 1
             return
         end
+        local sx, sy = compScale()
+        if (sx ~= 1 or sy ~= 1) then
+            if type(a1) == "table" and typeof(a1.Value) == "Vector3" then
+                a1 = { Value = Vector3.new(a1.Value.X * sx, a1.Value.Y * sy, a1.Value.Z),
+                       Damper = a1.Damper, Speed = a1.Speed }
+            end
+            if type(a2) == "table" and typeof(a2.Value) == "Vector3" then
+                a2 = { Value = Vector3.new(a2.Value.X * sx, a2.Value.Y * sy, a2.Value.Z),
+                       Damper = a2.Damper, Speed = a2.Speed }
+            end
+            S.recoilKickScaled = (S.recoilKickScaled or 0) + 1
+        end
         return origKick(a1, a2, ...)
     end
 
@@ -5118,30 +7210,138 @@ S.noRecoilHook = function()
     return true
 end
 
--- 自动压枪：读弹簧当前值，反向补到相机
+-- 自动压枪：每帧把「当前弹簧值」整个抵消掉
 --
--- ⚠ 这里的符号曾经是错的：写成 kick.X * k（正号）等于把后坐力**又叠加一次**，
--- 用户看到的就是「开火时镜头上下抖得更厉害」。压枪必须是**反向**的。
+-- ⚠ 这里踩过两次，第二次是刚修完又回退的，记清楚：
 --
--- 另外：noRecoil 打开时 setWeaponRecoil 被拦，弹簧恒为 0，压枪无事可做 ——
--- 两个选项同时开只会互相打架，所以这里直接跳过。
+--   ① 符号写反（kick.X * k）→ 等于把后坐力再叠一次。
+--
+--   ② 误以为「补偿会累积」→ 改成补 delta（kick - lastKick）。
+--      实测（两帧 RenderStep 探针，优先级 2000）：
+--          第 1 帧写 cam.CFrame = c * 6°
+--          第 2 帧读回的 cam.CFrame 与第 1 帧夹角 = 0.00°
+--      也就是说**游戏每帧都从 base*kick 重建相机，我们的写入不保留**。
+--      在这种情况下补 delta 只能补到「本帧变化量」，历史累积的 kick 一直在，
+--      表现就是用户看到的：子弹方向被别的机制压住了，画面准星/镜头照样飞。
+--
+-- 所以正确做法是绝对值：每帧补 -kick_now。因为上一帧的补偿已经被游戏覆盖，
+-- 不存在累积过冲。cap 只是防「换枪/弹簧重置瞬间 kick 突增」把镜头拽飞。
+--
+-- 垂直/水平分开配：
+--   垂直（pitch，kick.X）方向确定，可以 100% 压平；
+--   水平（yaw，kick.Y）方向随机，压满会显得锁死，默认 60%。
+S._recoilLastKick = Vector3.new(0, 0, 0)
+S._recoilCompAccum = 0
+
 S.applyRecoilComp = function(dt)
-    local pct = tonumber(cfg.recoilCompPercent) or 0
-    if cfg.autoRecoilComp ~= true or pct <= 0 then return end
+    local kv = tonumber(cfg.recoilCompV) or tonumber(cfg.recoilCompPercent) or 0
+    local kh = tonumber(cfg.recoilCompH) or tonumber(cfg.recoilCompPercent) or 0
+    if cfg.autoRecoilComp ~= true or (kv <= 0 and kh <= 0) then return end
     if cfg.noRecoil == true then return end
+    -- ⚠ 源头已经在压（noRecoilHook 缩放了 setWeaponRecoil / weaponKick 的灌入值）时，
+    -- 这里再补一次相机会变成双重压制，甚至反向过冲。两者只允许生效一个。
+    if S.noRecoilHookOn and S.recoilCompScale then return end
     local ok, CC = pcall(require, game.ReplicatedStorage.Controllers.CameraController)
     if not ok or type(CC) ~= "table" then return end
-    local okv, kick = pcall(CC.getWeaponKickRotation)
+    local okv, kick = pcall(getgenv().MV_ORIG_KICKROT or CC.getWeaponKickRotation)
     if not okv or typeof(kick) ~= "Vector3" then return end
-    if kick.Magnitude < 0.0005 then return end
+    S._recoilLastKick = kick   -- 只作诊断，不参与计算
+
+    if kick.Magnitude < 0.0002 then return end
+
     local cam = workspace.CurrentCamera
     if not cam then return end
-    local k = math.clamp(pct / 100, 0, 1)
-    -- 反向：弹簧把枪口往上抬 kick.X，压枪就往回拉 -kick.X
+    local kx = math.clamp(kv / 100, 0, 1)
+    local ky = math.clamp(kh / 100, 0, 1)
+    -- 单帧上限 15°：正常 kick 只有 1~5°，这个 cap 只在异常跳变时生效
+    local cap = math.rad(15)
+    local dx = math.clamp(-kick.X * kx, -cap, cap)
+    local dy = math.clamp(-kick.Y * ky, -cap, cap)
     pcall(function()
-        cam.CFrame = cam.CFrame * CFrame.fromEulerAnglesXYZ(-kick.X * k, -kick.Y * k, 0)
+        cam.CFrame = cam.CFrame * CFrame.fromEulerAnglesXYZ(dx, dy, 0)
     end)
     S.recoilCompSteps = (S.recoilCompSteps or 0) + 1
+    S._recoilCompAccum = (S._recoilCompAccum or 0) + math.abs(dx) + math.abs(dy)
+end
+
+-- ⚠ 准星（Crosshair）是独立链路，压相机管不到它。
+--
+-- 反编译 ReplicatedStorage.Interface.Screens.Gameplay.Middle.Crosshair：
+--     local v3 = CameraController.getWeaponKickRotation()
+--     local RotationValue = a1.Recoil.RotationValue
+--     local v5 = Vector2.new(v4.Y - v3.Y, v4.X - v3.X) * 57.29577951308232
+--     return UDim2.fromScale(...)   -- 准星相对屏幕中心的偏移
+--
+-- 也就是说：**准星偏移 = RotationValue - kick，它完全不读相机。**
+--
+-- 所以压枪（把相机压回基准）之后会得到：
+--   画面：稳
+--   准星：偏移变成整个 RotationValue（因为 kick 被压小了，减掉的变少）
+-- 这正是「弹道压住了，准星反而更偏」。
+--
+-- 正确做法不是缩放 kick，而是让准星读到的值**等于它自己用的 RotationValue**：
+--   偏移 = RotationValue - RotationValue = 0 → 准星死死钉在屏幕中心。
+--
+-- RotationValue 可以拿到（实测 Glock-18）：
+--   ic.peekCurrentEquippedForMovement().Recoil.RotationValue  → Vector3
+--
+-- 注意 weapon 的 Recoil 表结构：
+--   { Value:vector, RotationValue:vector, RecoveryValue:userdata,
+--     Time:number, RecoveryTime:number, RecoveryStartTime:number,
+--     ActiveFireRate:number, Function:function, Functions:table }
+--
+-- 我们自己的 applyRecoilComp 必须用**原版**（MV_ORIG_KICKROT）读真实 kick。
+S.installKickRotHook = function()
+    local ok, CC = pcall(require, game.ReplicatedStorage.Controllers.CameraController)
+    if not ok or type(CC) ~= "table" then return false end
+    local orig = getgenv().MV_ORIG_KICKROT
+    if typeof(orig) ~= "function" then
+        orig = CC.getWeaponKickRotation
+        getgenv().MV_ORIG_KICKROT = orig
+    end
+    CC.getWeaponKickRotation = function(...)
+        local k = orig(...)
+        if typeof(k) ~= "Vector3" then return k end
+        if cfg.autoRecoilComp ~= true or cfg.noRecoil == true then return k end
+        -- 让准星公式 (RotationValue - kick) 只留下"没压掉的那部分"：
+        --   压枪 100% → return RV      → 偏移 = 0
+        --   压枪 33%  → return RV*0.33 → 偏移 = 0.67*RV（准星按比例跟着抖）
+        --   压枪 0%   → return 0       → 偏移 = RV（原始表现）
+        -- 之前无条件 return RV，等于把准星焊死在中心，跟压枪比例无关 —— 用户实测 33% 也不动。
+        local kv = math.clamp((tonumber(cfg.recoilCompV) or tonumber(cfg.recoilCompPercent) or 0) / 100, 0, 1)
+        local kh = math.clamp((tonumber(cfg.recoilCompH) or tonumber(cfg.recoilCompPercent) or 0) / 100, 0, 1)
+        local ic = getInvCtrl()
+        if ic then
+            local okw, w = pcall(function() return ic.peekCurrentEquippedForMovement() end)
+            if okw and w and type(w.Recoil) == "table" then
+                local rv = w.Recoil.RotationValue
+                if typeof(rv) == "Vector3" then
+                    S.kickRotPinned = (S.kickRotPinned or 0) + 1
+                    -- ⚠ 只能缩放「滞后差」，不能缩放「绝对值」。
+                    --
+                    -- 准星偏移 = RotationValue - kick，而 kick 是弹簧的滞后值：
+                    -- 开火瞬间 RV 突增、kick 还没跟上 → 偏移大；随后 kick 追上 → 偏移回到 0。
+                    -- 这就是「准星会自己回正」的来源。
+                    --
+                    -- 如果直接 return RV*k，等于把偏移钉死在 (1-k)*RV 上，
+                    -- 准星会一直偏着、永不回落 —— 用户说的「偏移好假」就是这个。
+                    --
+                    -- 正确写法：hooked = RV*k + kick_orig*(1-k)
+                    --   偏移 = RV - hooked = (RV - kick_orig)*(1-k)
+                    -- 即「原始滞后差按比例缩小」，形状不变、幅度变小。
+                    --   k=0    → hooked = kick_orig → 偏移原样
+                    --   k=100% → hooked = RV        → 偏移 0
+                    return Vector3.new(
+                        rv.X * kv + k.X * (1 - kv),
+                        rv.Y * kh + k.Y * (1 - kh),
+                        k.Z)
+                end
+            end
+        end
+        return k
+    end
+    S.kickRotHookOn = true
+    return true
 end
 
 ---------------------------------------------------------------------
@@ -5197,6 +7397,66 @@ S.killShootDelay = function()
     return true
 end
 
+-- 准星钉住：把 Crosshair 的分叉按回最小扩散
+--
+-- ⚠ 必须在 **Heartbeat** 调用，不能只放在 RenderStep(2000)。
+--
+-- 实测（同一段 2.5 秒采样，看 Middle.Crosshair 各子元素的 Position 范围）：
+--   · 放在 RenderStep(2000) → Ticks 1..11、InnerTicks 1..7、Hitmarker ±6 全在张合
+--   · 放在 Heartbeat        → 全部元素 0 变化
+-- 也就是说游戏是在渲染之后（Heartbeat 阶段）才把准星位置写回去的，
+-- RenderStep 里改得再早也会被覆盖。用户看到的「子弹压住了、准星还在张合」就是这个。
+S.pinCrosshair = function()
+    if not (cfg.noRecoil == true or cfg.autoRecoilComp == true) then return end
+    local pg = LP and LP:FindFirstChild("PlayerGui")
+    local mg = pg and pg:FindFirstChild("MainGui")
+    local gp = mg and mg:FindFirstChild("Gameplay")
+    local mid = gp and gp:FindFirstChild("Middle")
+    local ch = mid and mid:FindFirstChild("Crosshair")
+    if not ch then return end
+    local BASE = 7
+    for _, d in ipairs(ch:GetDescendants()) do
+        local n = d.Name
+        -- ⚠ 只处理 Ticks / InnerTicks 两层（准星分叉）。
+        -- Hitmarker 下面也有叫 "Arm" 的四个斜角，那是「命中标记」的动画，
+        -- 按住它会让打中人的反馈消失/变形 —— 必须排除。
+        local par = d.Parent and d.Parent.Name or ""
+        if par == "Ticks" or par == "InnerTicks" then
+            if n == "Right" or n == "Left" or n == "Up" or n == "Down" then
+                local okp, p = pcall(function() return d.Position end)
+                if okp and typeof(p) == "UDim2" then
+                    local tx, ty
+                    if n == "Right" then tx, ty = BASE, 0
+                    elseif n == "Left" then tx, ty = -BASE, 0
+                    elseif n == "Up" then tx, ty = 0, -BASE
+                    else tx, ty = 0, BASE end
+                    if p.X.Offset ~= tx or p.Y.Offset ~= ty then
+                        d.Position = UDim2.new(p.X.Scale, tx, p.Y.Scale, ty)
+                    end
+                end
+            end
+        end
+    end
+end
+
+-- 真正生效的驱动力：Heartbeat + task.defer
+--
+-- ⚠ 为什么必须套一层 defer：
+--   · 放在 RenderStep(2000)     → 2.5 秒采样里 Ticks 1..13 一直在张合（游戏渲染后又写回去）
+--   · Heartbeat 里直接写        → 同样被覆盖（我们的连接排在游戏更新之前）
+--   · Heartbeat 里 task.defer 写 → 同一窗口内 0 变化
+--   defer 把写入推到本帧调度末尾、渲染之前，这时候游戏本轮已经写完了。
+do
+    local hb = RunService.Heartbeat:Connect(function()
+        if S._alive == false or (REG and REG.gen ~= MY_GEN) then return end
+        task.defer(function()
+            if S._alive == false then return end
+            pcall(S.pinCrosshair)
+        end)
+    end)
+    if S.conns then S.conns[#S.conns + 1] = hb end
+end
+
 S.updateSpinCam = function(dt)
     -- ⚠ 无后座模式下把准星「锁住」。
     --
@@ -5210,48 +7470,10 @@ S.updateSpinCam = function(dt)
     -- 这不是相机在动（相机 pitch 实测跨度 0.00），而是游戏把 Spread 画成了准星张合。
     -- 弹道方向由相机决定，所以「弹道稳、准星飘」——两套东西各走各的。
     --
-    -- 这里在 noRecoil 模式下每帧把它们按回最小扩散值。只影响显示，不影响命中。
-    if cfg.noRecoil == true then
-        pcall(function()
-            local pg = LP and LP:FindFirstChild("PlayerGui")
-            local mg = pg and pg:FindFirstChild("MainGui")
-            local gp = mg and mg:FindFirstChild("Gameplay")
-            -- ⚠ 这里原来写的是 `local mid = gp and mid and gp:FindFirstChild("Middle")`
-            -- —— 右边那个 mid 是它自己（未赋值）或外层同名变量，属于自引用。
-            -- 外层没有 mid 时整个表达式恒为 nil，准星复位就静默失效了。
-            local mid = gp and gp:FindFirstChild("Middle")
-            local ch = mid and mid:FindFirstChild("Crosshair")
-            if not ch then return end
-            -- 四个正交分叉：Right/Left 改 X 偏移，Up/Down 改 Y 偏移，基准 7
-            local BASE = 7
-            for _, d in ipairs(ch:GetDescendants()) do
-                local n = d.Name
-                if n == "Right" or n == "Left" or n == "Up" or n == "Down" then
-                    local okp, p = pcall(function() return d.Position end)
-                    if okp and typeof(p) == "UDim2" then
-                        if n == "Right" and p.X.Offset ~= BASE then
-                            d.Position = UDim2.new(p.X.Scale, BASE, p.Y.Scale, p.Y.Offset)
-                        elseif n == "Left" and p.X.Offset ~= -BASE then
-                            d.Position = UDim2.new(p.X.Scale, -BASE, p.Y.Scale, p.Y.Offset)
-                        elseif n == "Up" and p.Y.Offset ~= -BASE then
-                            d.Position = UDim2.new(p.X.Scale, p.X.Offset, p.Y.Scale, -BASE)
-                        elseif n == "Down" and p.Y.Offset ~= BASE then
-                            d.Position = UDim2.new(p.X.Scale, p.X.Offset, p.Y.Scale, BASE)
-                        end
-                    end
-                elseif n == "Arm" then
-                    -- 斜角臂保持 ±6，不让它在 ±6 之间来回跳
-                    local okp, p = pcall(function() return d.Position end)
-                    if okp and typeof(p) == "UDim2" then
-                        local sx = (p.X.Offset >= 0) and 6 or -6
-                        local sy = (p.Y.Offset >= 0) and 6 or -6
-                        if p.X.Offset ~= sx or p.Y.Offset ~= sy then
-                            d.Position = UDim2.new(p.X.Scale, sx, p.Y.Scale, sy)
-                        end
-                    end
-                end
-            end
-        end)
+    -- 准星钉住已提取到 S.pinCrosshair，并且改由 Heartbeat 驱动（见该函数上方的实测说明）。
+    -- 这里只保留一次调用做兜底，真正的钉住在 Heartbeat 里。
+    if cfg.noRecoil == true or cfg.autoRecoilComp == true then
+        pcall(S.pinCrosshair)
     end
 
     -- 磁吸守护（见下方注释）。跳过拉栓已经移到 Heartbeat 每帧执行。
@@ -5261,8 +7483,13 @@ S.updateSpinCam = function(dt)
     -- S.noRecoilHook() 原来只在点 GUI 开关时调用一次，重载脚本后不会自动装回去。
     -- 结果 cfg.noRecoil 明明是 true，setWeaponRecoil 却没人拦（recoilBlocked 恒为 nil），
     -- 后坐力照常生效。用户看到的就是「开了无后座但镜头还是抖」。
-    if cfg.noRecoil == true and not S.noRecoilHookOn then
+    if (cfg.noRecoil == true or cfg.autoRecoilComp == true) and not S.noRecoilHookOn then
         pcall(S.noRecoilHook)
+    end
+    -- 准星链路兜底重装：换局时 CameraController 可能被重新初始化，hook 会被冲掉。
+    -- 冲掉之后准星就又会按 (RotationValue - 原始kick) 画，压枪越猛它偏得越多。
+    if (cfg.autoRecoilComp == true or cfg.noRecoil == true) and not S.kickRotHookOn then
+        pcall(S.installKickRotHook)
     end
     -- ⚠ 这个函数现在兼职「磁吸守护」。
     --
@@ -5272,6 +7499,34 @@ S.updateSpinCam = function(dt)
     --
     -- 这里每帧检查：只要发现挂的不是我们那个恒返回 (0,0) 的函数，就重新焊上。
     -- 开销极小（一次表比较），但能保证不管换多少局磁吸都关着。
+    -- ⚠⚠ 这里以前只做「重装」：`if type(MV_MAG_HOOK) == "function" then ... 重焊`
+    -- —— 但**从来没有地方给它赋过值**。于是整段逻辑永远跳过，
+    -- 游戏的 AimAssistController.GetMagnetismRotation 一直是原版：
+    -- 附近有敌人时游戏自己会把相机转过去（360 度也照转），
+    -- 完全绕开脚本的 FOV / 可见性 / 队伍判定。
+    -- 用户实测「手动转到背后，它一个 360 度给我拉回去，手都停了」就是这个。
+    --
+    -- 现在改成：没装就装，装了被覆盖就重焊。
+    if type(getgenv().MV_MAG_HOOK) ~= "function" then
+        pcall(function()
+            local RS2 = game:GetService("ReplicatedStorage")
+            local AA = require(RS2.Controllers.AimAssistController)
+            if type(getgenv().MV_ORIG_MAG) ~= "function" then
+                getgenv().MV_ORIG_MAG = AA.GetMagnetismRotation
+            end
+            local zeroVec2 = function() return Vector2.new(0, 0) end
+            getgenv().MV_MAG_HOOK = zeroVec2
+            AA.GetMagnetismRotation = zeroVec2
+            -- 同时中和游戏自带的后坐力辅助，否则它会在开枪时偷偷帮你压枪
+            if type(AA.GetRecoilAssistScale) == "function" then
+                AA.GetRecoilAssistScale = function() return Vector3.new(1, 1, 1) end
+            end
+            if type(AA.GetRecoilAssistMultiplier) == "function" then
+                AA.GetRecoilAssistMultiplier = function() return 0 end
+            end
+            S.magHooksInstalled = (S.magHooksInstalled or 0) + 1
+        end)
+    end
     if type(getgenv().MV_MAG_HOOK) == "function" then
         local ok, AA = pcall(require, game.ReplicatedStorage.Controllers.AimAssistController)
         if ok and type(AA) == "table" and AA.GetMagnetismRotation ~= getgenv().MV_MAG_HOOK then
@@ -5705,6 +7960,182 @@ getgenv().MV_RADAR = radar
 local learned = getgenv().MV_THROW_LEARNED or { speed = nil, samples = 0, weapon = "?", samplesList = {} }
 if type(learned.samplesList) ~= "table" then learned.samplesList = {} end
 getgenv().MV_THROW_LEARNED = learned
+
+-- ═══════════════════════════════════════════════════════════════
+-- 学习数据持久化（mv_learned.json）
+--
+-- 先澄清一个容易混的点：「保存配置」和「学习数据」是两套完全独立的东西。
+--   · cfg 存档（MV_CFG_SAVE）只收 boolean / number / string，从来不包含 learned
+--   · learned / vfxLearn 只挂在 getgenv() 上
+-- 于是：
+--     重载脚本（loadstring 再跑一遍）     → 学习数据还在（同一个 getgenv）
+--     重新注入执行器 / 重进服务器 / 关游戏  → 学习数据全丢，存档也救不回来
+-- 也就是说：不保存配置时，学习数据不是"没保存下来"，而是它压根没进过存档。
+--
+-- 这里给它单独落盘。只存「可复算的标量」：初速、起点偏移、每把武器的物理参数、
+-- 烟雾/火焰实测时长。不存 tracked / samplesList —— 那是每颗雷的运行时记录，
+-- 重启即失效，写进去只会让下次加载读到一堆过期坐标。
+-- 没有 writefile 的执行器（部分手机端）自动跳过，不影响其它功能。
+-- 手动接口：MV_LEARN_SAVE() / MV_LEARN_WIPE()
+-- ═══════════════════════════════════════════════════════════════
+do
+    (function()
+        local HS = game:GetService("HttpService")
+        local FILE = "mv_learned.json"
+        local KEYS = {
+            "speed", "samples", "weapon", "originOffset", "perWeapon", "byWeapon",
+            "physics", "landErr", "bounceErr", "bounceErrSamples",
+            "bounceMissTotal", "bounceExtraTotal",
+        }
+
+        local function pack(v)
+            if typeof(v) == "Vector3" then return { __v3 = { v.X, v.Y, v.Z } } end
+            if type(v) ~= "table" then return v end
+            local o = {}
+            for k, x in pairs(v) do
+                if type(k) ~= "table" then o[k] = pack(x) end
+            end
+            return o
+        end
+
+        local function unpack_(v)
+            if type(v) ~= "table" then return v end
+            if type(v.__v3) == "table" then
+                return Vector3.new(tonumber(v.__v3[1]) or 0, tonumber(v.__v3[2]) or 0, tonumber(v.__v3[3]) or 0)
+            end
+            local o = {}
+            for k, x in pairs(v) do o[k] = unpack_(x) end
+            return o
+        end
+
+        S.learnedFile = FILE
+
+        S.saveLearned = function()
+            if not writefile then return false, "no-writefile" end
+            -- ⚠ 以磁盘上已有的内容为底，内存里有值才覆盖。
+            -- 之前直接 `payload.vfx = {}` 再按内存填：一旦这一次内存里 median 是 nil
+            -- （比如刚重载、vfxLearn 还没学到东西），就会把磁盘上的 18s / 5.5s 覆盖成空，
+            -- 下次加载反而学不到东西 —— 实测真丢过一次，进度条变回 0。
+            local old = {}
+            if readfile then
+                local okf, ex = pcall(function()
+                    if isfile then return isfile(FILE) end
+                    return true
+                end)
+                if okf and ex then
+                    local okr, raw = pcall(readfile, FILE)
+                    if okr and type(raw) == "string" and #raw > 1 then
+                        local okj, d = pcall(function() return HS:JSONDecode(raw) end)
+                        if okj and type(d) == "table" then old = d end
+                    end
+                end
+            end
+            local payload = { v = 1, throw = {}, vfx = {} }
+            if type(old.throw) == "table" then
+                for k, v in pairs(old.throw) do payload.throw[k] = v end
+            end
+            if type(old.vfx) == "table" then
+                for _, kind in ipairs({ "smoke", "fire" }) do
+                    local ob = old.vfx[kind]
+                    if type(ob) == "table" and tonumber(ob.median) then
+                        payload.vfx[kind] = { median = tonumber(ob.median) }
+                    end
+                end
+            end
+            for _, k in ipairs(KEYS) do
+                if learned[k] ~= nil then payload.throw[k] = pack(learned[k]) end
+            end
+            local vl = getgenv().MV_VFX_LEARNED
+            if type(vl) == "table" then
+                for _, kind in ipairs({ "smoke", "fire" }) do
+                    local b = vl[kind]
+                    local m = type(b) == "table" and tonumber(b.median)
+                    if m then
+                        payload.vfx[kind] = { median = m }
+                    end
+                end
+            end
+            local okj, js = pcall(function() return HS:JSONEncode(payload) end)
+            if not okj then return false, tostring(js) end
+            local okw, err = pcall(writefile, FILE, js)
+            if not okw then return false, tostring(err) end
+            S.learnedSavedAt = os.date("%H:%M:%S")
+            return true
+        end
+
+        S.loadLearned = function()
+            if not readfile then return false, "no-readfile" end
+            local okf, exists = pcall(function()
+                if isfile then return isfile(FILE) end
+                return true
+            end)
+            if not okf or not exists then return false, "no-file" end
+            local okr, raw = pcall(readfile, FILE)
+            if not okr or type(raw) ~= "string" or #raw < 2 then return false, "read-fail" end
+            local okj, data = pcall(function() return HS:JSONDecode(raw) end)
+            if not okj or type(data) ~= "table" then return false, "bad-json" end
+            local n = 0
+            for _, k in ipairs(KEYS) do
+                if type(data.throw) == "table" and data.throw[k] ~= nil then
+                    learned[k] = unpack_(data.throw[k])
+                    n = n + 1
+                end
+            end
+            local vl = getgenv().MV_VFX_LEARNED
+            if type(vl) == "table" and type(data.vfx) == "table" then
+                for _, kind in ipairs({ "smoke", "fire" }) do
+                    local b = data.vfx[kind]
+                    if type(b) == "table" and tonumber(b.median) and type(vl[kind]) == "table" then
+                        vl[kind].median = tonumber(b.median)
+                        n = n + 1
+                    end
+                end
+            end
+            return true, n
+        end
+
+        local okL, nL = S.loadLearned()
+        if okL then S.learnedLoaded = nL end
+
+        getgenv().MV_LEARN_SAVE = function() return S.saveLearned() end
+        getgenv().MV_LEARN_WIPE = function()
+            for _, k in ipairs(KEYS) do learned[k] = nil end
+            learned.samples = 0
+            if delfile then pcall(delfile, FILE) end
+            S.learnedSig = nil
+            S.learnedLoaded = 0
+            return true
+        end
+
+        -- 节流落盘：学习值真的变了才写（每 4 秒比一次签名）
+        S.learnedSig = nil
+        task.spawn(function()
+            while true do
+                task.wait(4)
+                -- ⚠ 必须能退出：这个循环原来没有任何存活判据，卸载/重载之后
+                -- 旧实例仍会每 4 秒读 learned 表、比签名、必要时写文件 ——
+                -- 重载几次就有几个这样的任务同时往同一个文件写。
+                if S._alive == false or (REG and REG.gen ~= MY_GEN) then break end
+                local oo = learned.originOffset
+                local vl = getgenv().MV_VFX_LEARNED
+                local sig = string.format("%s|%s|%s|%s|%s",
+                    tostring(learned.samples), tostring(learned.speed),
+                    tostring(type(oo) == "table" and oo.hits or nil),
+                    tostring(vl and vl.smoke and vl.smoke.median),
+                    tostring(vl and vl.fire and vl.fire.median))
+                if sig ~= S.learnedSig then
+                    local ok, err = S.saveLearned()
+                    if ok then
+                        S.learnedSig = sig
+                        S.learnedSaveErr = nil
+                    else
+                        S.learnedSaveErr = tostring(err)
+                    end
+                end
+            end
+        end)
+    end)()
+end
 
 -- ═══════════════════════════════════════════════════════════════
 -- 学习「按下 → 出手」的真实延迟，替代硬编码的 throwPredictLead = 0.7
@@ -6167,6 +8598,12 @@ if type(vfxLearn) ~= "table" then vfxLearn = {} end
 if type(vfxLearn.smoke) ~= "table" then vfxLearn.smoke = { active = {}, durations = {} } end
 if type(vfxLearn.fire) ~= "table" then vfxLearn.fire = { active = {}, durations = {} } end
 getgenv().MV_VFX_LEARNED = vfxLearn
+
+-- vfxLearn 是这一行才创建的：上面那次 S.loadLearned()（learned 定义处）执行时
+-- getgenv().MV_VFX_LEARNED 还不存在，vfx 分支被跳过。
+-- 这里补读一次，把烟雾 18s / 火焰 5.5s 这些实测值也恢复回来
+-- （throw 部分重复赋一遍相同的值，无害）。
+if S.loadLearned then pcall(S.loadLearned) end
 
 -- 从体素列表算覆盖范围和中心
 --   烟雾: Voxels[i] = { Position, Size }
@@ -6666,8 +9103,11 @@ local function fovClear()
 end
 
 local function updateFov()
-    if not (cfg.silentAim and cfg.showFov) then
-        if fovCircle then fovCircle.Visible = false end
+    -- 360°（fullSphere）时不画范围圈：本来就是全向锁定，圈没有信息量，只会挡视线。
+    -- ⚠ 以前这里 AND 了 cfg.silentAim —— 关掉静默瞄准会连圈一起消失，
+    -- 用户看到的现象是「360° 关了但范围圈还是不显示」。圈只该受 showFov / fullSphere 控制。
+    local hideBySphere = (cfg.fullSphere == true) and ((cfg.aimMode or "smooth") == "silent")
+    if hideBySphere or not cfg.showFov then
         for _, l in ipairs(fovSegments) do if l then l.Visible = false end end
         return
     end
@@ -7164,7 +9604,7 @@ local function updateGrenades()
                             -- 贴地
                             local cc = info.lastPos
                             local okr2, gh2 = pcall(function()
-                                return workspace:Raycast(cc, Vector3.new(0, -40, 0), groundParams)
+                                return workspace:Raycast(cc, Vector3.new(0, -250, 0), groundParams)
                             end)
                             if okr2 and gh2 then
                                 cc = Vector3.new(cc.X, gh2.Position.Y + 0.15, cc.Z)
@@ -7198,7 +9638,7 @@ local function updateGrenades()
                                 gK.text.Size = 22
                                 gK.text.Outline = true
                                 gK.text.Color = colK
-                                gK.text.Text = string.format("%s  效果 %.1fs", tostring(gname), effLeft)
+                                gK.text.Text = string.format("%s  %.1fs", tostring(gname), effLeft)
                                 gK.text.Position = Vector2.new(cspK.X, cspK.Y - 18)
                             elseif gK.text then
                                 gK.text.Visible = false
@@ -7247,7 +9687,7 @@ local function updateGrenades()
                         -- 圈贴地：从当前点向下找地面，避免在空中画悬浮圈
                         local circleCenter = pos
                         local okr, groundHit = pcall(function()
-                            return workspace:Raycast(pos, Vector3.new(0, -40, 0), groundParams)
+                            return workspace:Raycast(pos, Vector3.new(0, -250, 0), groundParams)
                         end)
                         if okr and groundHit then
                             circleCenter = Vector3.new(pos.X, groundHit.Position.Y + 0.15, pos.Z)
@@ -8663,7 +11103,7 @@ local function updateThrow()
         -- 于是屏幕上同一个落点"一高一低"。用户已经明确指出这个。
         -- 距地 6 stud 以内才吸；明显在空中爆炸的抛投保持原高度。
         local okG, gHit = pcall(function()
-            return workspace:Raycast(impactPos, Vector3.new(0, -40, 0), rp)
+            return workspace:Raycast(impactPos, Vector3.new(0, -250, 0), rp)
         end)
         if okG and gHit and (impactPos.Y - gHit.Position.Y) < 6 then
             impactPos = Vector3.new(impactPos.X, gHit.Position.Y + 0.12, impactPos.Z)
@@ -8722,7 +11162,7 @@ local function updateThrow()
             m.text.Size = 20
             m.text.Outline = true
             m.text.Color = cfg.throwColor
-            m.text.Text = string.format("预 %.0fm", dist)
+            m.text.Text = string.format("PRE %.0fm", dist)
             m.text.Position = Vector2.new(isp.X, isp.Y - 22)
         elseif m.text then
             m.text.Visible = false
@@ -8753,7 +11193,7 @@ local function updateThrow()
                 m.realText.Color = Color3.fromRGB(255, 80, 255)
                 -- 加「实」字前缀：这圈是服务端 Projectile.Resolve 回传的真实落点，
                 -- 不是预测。原来只显示一个裸数字，没人认得出它是干什么的。
-                m.realText.Text = string.format("实 %.0fm", (realPos - cam.CFrame.Position).Magnitude)
+                m.realText.Text = string.format("HIT %.0fm", (realPos - cam.CFrame.Position).Magnitude)
                 m.realText.Position = Vector2.new(rsp.X, rsp.Y + 26)
             elseif m.realText then
                 m.realText.Visible = false
@@ -9038,11 +11478,20 @@ local function updateEsp()
     end
 
     espTick += 1
+    -- 性能节流：手机每 2 帧刷一次 ESP，中间那一帧直接返回（框保持在上一帧的位置）。
+    -- 关掉 ESP 的分支在上面，所以关的时候是立即隐藏，不受这里影响。
+    local espEvery = tonumber(cfg.espEveryNFrames) or 1
+    if espEvery > 1 and (espTick % espEvery) ~= 0 then return end
+
     -- ⚠ updateEsp 里原来没有 cam 变量：只有 w2s() 内部自己去取 CurrentCamera。
     -- 结果下面 drawSkeleton(set, cam, ...) / drawHitboxes(set, cam, ...) 传进去的是
     -- 全局 nil，一路报 "attempt to index nil with 'WorldToViewportPoint'"，
     -- 骨架和碰撞箱从来没画出来过。这里补上。
     local cam = workspace.CurrentCamera
+    -- ⚠ 目标列表只在「这一帧真的要画」时才算，不做独立的第二层缓存。
+    -- 之前这里是 `if espTick % 2 == 0 then allTargets() end` —— 和上面 updateEsp 的
+    -- %espEvery 节流是两个互相独立的周期，错位时会叠加成最多 3 帧（50ms@60fps）延迟，
+    -- 快速横移的目标会出现「框追不上人」。现在两者共用同一个节流点，最坏就是 espEvery 帧。
     local targets = allTargets()
     local alive = {}
 
@@ -9255,7 +11704,10 @@ local function updateEsp()
                 set.frozen.Visible = showTag
                 if showTag then
                     local secs = tonumber(t.ageSec) or 0
-                    set.frozen.Text = string.format("旧 %.1fs", secs)
+                    -- ⚠ Drawing 的 Text 用的是引擎默认字体，**没有中文字形**，
+                    -- 写中文会渲染成「❓ / 方框」。这里原来写的是 "旧 %.1fs"，
+                    -- 屏幕上就是那个神秘符号。全部改用 ASCII。
+                    set.frozen.Text = string.format("OLD %.1fs", secs)
                     set.frozen.Color = Color3.fromRGB(200, 195, 110)
                     set.frozen.Size = 13
                     set.frozen.Center = true
@@ -9309,6 +11761,432 @@ local function updateEsp()
         end
     end
 end
+-- ═══════════════════════════════════════════════════════════════
+-- C4 / 炸药透视
+-- 服务端下包的 C4 模型会出现在 workspace 或 workspace.Map 下（名字含 C4 / Bomb）。
+-- 现在地图里没包时扫描结果为 0，是正常的 —— 有人下包才出现。
+-- 每秒扫一次（不每帧全扫，避免卡帧），绘制在 updateEsp 的同一帧里做。
+-- ═══════════════════════════════════════════════════════════════
+-- ═══ C4 位置：靠 C4.Planted 广播，不靠扫模型 ═══
+-- 实测下包后 workspace 里根本没有 C4 模型（关键词全扫命中 0，只有误匹配的 Sound），
+-- 因为服务端不给 CT 复制模型（PVS）。真正的信息来源是 Remotes.C4 的回包。
+S.c4Planted = nil
+S.c4PlantedInfo = ""
+do
+    local ok, Remotes = pcall(function() return require(RS.Database.Security.Remotes) end)
+    if ok and type(Remotes) == "table" and Remotes.C4 then
+        local C4 = Remotes.C4
+        local function hook(name, fn)
+            local p = C4[name]
+            if p and type(p.Listen) == "function" then
+                pcall(function() p.Listen(function(d) pcall(fn, d) end) end)
+            end
+        end
+        hook("Planted", function(d)
+            S.c4Planted = d
+            S.c4PlantedAt = os.clock()
+            local parts = {}
+            if type(d) == "table" then
+                for k, v in pairs(d) do
+                    if type(v) ~= "table" then parts[#parts + 1] = tostring(k) .. "=" .. tostring(v) end
+                end
+            end
+            table.sort(parts)
+            S.c4PlantedInfo = table.concat(parts, " "):sub(1, 300)
+        end)
+        hook("Start", function(d) S.c4Start = d end)
+        hook("Defused", function(d) S.c4Planted = nil; S.c4Defused = d end)
+        hook("Cancel", function(d) S.c4Planted = nil end)
+        hook("ForceCancel", function(d) S.c4Planted = nil end)
+        S.c4Hooked = true
+    end
+end
+
+S.worldItems = {}
+S.worldMarks = {}
+S.worldLastScan = 0
+
+-- 扫描世界里的「可透视物件」：C4 + 别人扔出去的投掷物
+-- 名字匹配要宽松：服务端复制过来的模型常叫 "C4" / "HE Grenade" / "Molotov" / "Smoke Grenade" 等
+S.scanWorldItems = function()
+    local found = {}
+    local function add(d, kind)
+        if d:IsA("Model") or d:IsA("BasePart") or d:IsA("Tool") then
+            found[#found + 1] = { obj = d, kind = kind }
+        end
+    end
+    local function classify(nm)
+        local s = string.lower(nm)
+        if s == "c4" or s:find("plantedc4") then return "c4" end
+        if s:find("molotov") or s:find("incendiary") then return "fire" end
+        if s:find("smoke") then return "smoke" end
+        if s:find("flash") then return "flash" end
+        if s:find("decoy") then return "decoy" end
+        if s:find("grenade") or s:find("he ") or s == "he" or s:find("frag") then return "he" end
+        if s:find("bomb") then return "c4" end
+        return nil
+    end
+    local function scan(root, depth)
+        if not root or depth > 2 then return end
+        for _, d in ipairs(root:GetChildren()) do
+            local k = classify(tostring(d.Name))
+            if k then add(d, k) end
+        end
+    end
+    scan(workspace, 0)
+    scan(workspace:FindFirstChild("Map"), 1)
+    scan(workspace:FindFirstChild("Debris"), 1)
+    scan(workspace:FindFirstChild("Characters"), 1)
+    S.worldItems = found
+    S.worldCount = #found
+end
+
+S.worldColor = {
+    c4 = Color3.fromRGB(255, 70, 70),
+    fire = Color3.fromRGB(255, 140, 40),
+    smoke = Color3.fromRGB(190, 190, 210),
+    flash = Color3.fromRGB(255, 245, 120),
+    decoy = Color3.fromRGB(140, 220, 140),
+    he = Color3.fromRGB(255, 100, 60),
+}
+S.worldLabel = {
+    c4 = "C4", fire = "燃烧", smoke = "烟雾", flash = "闪光", decoy = "诱饵", he = "手雷",
+}
+
+S.drawWorldItems = function()
+    if not cfg.showWorldItems then   -- 默认关闭；nil 也视为关闭（原来写 == false，nil 会漏过去）
+        for _, m in pairs(S.worldMarks) do
+            if m.text then pcall(function() m.text:Remove() end) end
+            if m.ring then pcall(function() m.ring:Remove() end) end
+        end
+        S.worldMarks = {}
+        return
+    end
+    local now = os.clock()
+    if now - S.worldLastScan >= 0.5 then
+        S.worldLastScan = now
+        pcall(S.scanWorldItems)
+    end
+    local cam = workspace.CurrentCamera
+    if not cam then return end
+    local seen = {}
+    for _, rec in ipairs(S.worldItems) do
+        local obj, kind = rec.obj, rec.kind
+        if obj and obj.Parent then
+            local ok, pos = pcall(function()
+                if obj:IsA("BasePart") then return obj.Position end
+                return obj:GetPivot().Position
+            end)
+            if ok and typeof(pos) == "Vector3" then
+                local sp = cam:WorldToViewportPoint(pos)
+                if sp.Z > 0 then
+                    local key = tostring(obj:GetFullName()) .. "#" .. kind
+                    seen[key] = true
+                    local mark = S.worldMarks[key]
+                    if not mark then
+                        mark = {}
+                        local t = Drawing.new("Text")
+                        t.Size = 15
+                        t.Center = true
+                        t.Outline = true
+                        t.Color = S.worldColor[kind] or Color3.new(1, 1, 1)
+                        mark.text = t
+                        S.worldMarks[key] = mark
+                    end
+                    local dist = (pos - cam.CFrame.Position).Magnitude
+                    if mark.text then
+                        mark.text.Visible = true
+                        mark.text.Position = Vector2.new(sp.X, sp.Y - 22)
+                        mark.text.Text = string.format("%s  %dm", S.worldLabel[kind] or kind, math.floor(dist))
+                        mark.text.Color = S.worldColor[kind] or Color3.new(1, 1, 1)
+                    end
+                end
+            end
+        end
+    end
+    for key, mark in pairs(S.worldMarks) do
+        if not seen[key] then
+            if mark.text then pcall(function() mark.text:Remove() end) end
+            if mark.ring then pcall(function() mark.ring:Remove() end) end
+            S.worldMarks[key] = nil
+        end
+    end
+end
+
+-- ═══ 换肤持久化轮询 ═══
+-- 为什么需要轮询：viewmodel 每次切枪/重生都会重建，重建后材质回到游戏自己的皮肤。
+-- 为什么是 0.12 秒而不是 1 秒：1 秒会让「游戏重置 → 我们刷回」的空窗长达 1 秒，
+-- 视觉上就是皮肤一闪一闪。0.12 秒（8Hz）足以把空窗压到肉眼几乎看不出。
+-- 为什么「只在材质不匹配时写」：无脑每帧写会不断触发材质刷新，
+-- 反而更容易被游戏的下一次重建覆盖，形成闪烁。
+S._matCache = {}
+-- ═══ 轮询耗时埋点 ═══
+-- 「0.12 秒循环是不是卡顿尖峰的真凶」这个争论不需要再靠感觉：
+-- 每次 tick 记录耗时，MV_V2.skinPoll() 直接给出 max / avg / p99 / 缓存命中率。
+-- 判据：max 远小于 16ms（一帧）就不是它；max 接近或超过 16ms 才是。
+S.skinPoll = {
+    ticks = 0, skips = 0, cacheHit = 0, cacheMiss = 0,
+    lastMs = 0, maxMs = 0, sumMs = 0, samples = {},
+}
+S.skinPoll.tick = function(t0, kind)
+    local st = S.skinPoll
+    local ms = (os.clock() - t0) * 1000
+    st.ticks += 1
+    st.lastMs = ms
+    st.sumMs += ms
+    if ms > st.maxMs then st.maxMs = ms end
+    if kind then st[kind] = (st[kind] or 0) + 1 end
+    -- 只留最近 256 个样本，算 P99 用（够用且不会涨内存）
+    local n = #st.samples + 1
+    if n > 256 then
+        table.remove(st.samples, 1)
+        n = 256
+    end
+    st.samples[n] = ms
+end
+S.skinPoll.report = function()
+    local st = S.skinPoll
+    local n = #st.samples
+    local p99 = 0
+    if n > 0 then
+        local copy = {}
+        for i = 1, n do copy[i] = st.samples[i] end
+        table.sort(copy)
+        p99 = copy[math.max(1, math.floor(n * 0.99))] or 0
+    end
+    return string.format(
+        "ticks=%d avg=%.2fms p99=%.2fms max=%.2fms last=%.2fms | cacheHit=%d cacheMiss=%d skip=%d | emptySrc=%d partsWritten=%d partsRejected=%d",
+        st.ticks,
+        (st.ticks > 0) and (st.sumMs / st.ticks) or 0,
+        p99, st.maxMs, st.lastMs,
+        st.cacheHit, st.cacheMiss, st.skips,
+        st.emptySrc or 0, st.partsWritten or 0, st.partsRejected or 0)
+end
+task.spawn(function()
+    while true do
+        task.wait(0.12)
+        if S._alive == false or (REG and REG.gen ~= MY_GEN) then break end
+        local t0 = os.clock()
+        pcall(function()
+            local ic = getInvCtrl()
+            if not ic then return end
+            local okw, w = pcall(function() return ic.peekCurrentEquippedForMovement() end)
+            if not okw or not w or not w.Name then
+                S.skinPoll.skips += 1
+                return
+            end
+            local wn = tostring(w.Name)
+            local want = S.skinPaint and S.skinPaint[wn]
+            if not want or want == "" or want == "Stock" then
+                S.skinPoll.skips += 1
+                return
+            end
+            -- ⚠⚠ 持续纠正 item.Skin。
+            --
+            -- InventoryController.getCurrentEquipped() 返回的 table 里，Skin 字段才是
+            -- 游戏构建 viewmodel 的依据。实测：我们改完能保持（persisted=true），
+            -- 但**游戏重建武器对象时会把它重置回真实装备的皮肤**（读回来又是 "Stock"）。
+            -- 结果是：切一次枪就被打回原皮，用户看到的就是「美化被固定住了」。
+            -- 这里每 0.12 秒检查一次，被重置就立刻改回去 —— 这样下次重建拿到的就是我们的皮肤。
+            pcall(function()
+                -- ★ 同 S.setSkin：这里也只用 peek，绝不碰原版 getCurrentEquipped。
+                local peek2 = ic.peekCurrentEquippedForMovement or ic.getCurrentEquipped
+                local cw = peek2 and peek2()
+                if cw and tostring(cw.Name) == wn and tostring(cw.Skin) ~= tostring(want) then
+                    cw.Skin = tostring(want)
+                    S.itemSkinFixes = (S.itemSkinFixes or 0) + 1
+                    S.itemSkinFixLast = string.format("%s: %s→%s", wn, tostring(cw.Skin), tostring(want))
+                end
+            end)
+            local cam = workspace:FindFirstChild("Camera")
+
+            -- ═══ 近战外观替换：已停用 ═══
+            --
+            -- ⚠ 这条路实测会把游戏状态搞坏，永久关闭（保留开关但默认不启用）：
+            --   1) 改 item.Name → 游戏重建武器对象时丢弃修改，物品栏变金色但拿刀显示手枪弹药
+            --   2) 换 viewmodel → 新建的模型**不会跟随相机**（游戏对原始模型有每帧绑定），
+            --      玩家一走开，枪就留在原地飘着；再切枪就彻底消失
+            --   3) 改 Viewmodel.Model 引用 → 会把引用指到别的武器上，导致两个模型叠在一起
+            -- 真正要换刀外观，必须走游戏自己的 equip 流程（服务端认可），客户端做不到。
+            if cfg.meleeSwapOn == true then
+                local swapTo = S.meleeSwap and S.meleeSwap[wn]
+                if swapTo and swapTo ~= wn then
+                    pcall(function()
+                        local GWP = require(game:GetService("ReplicatedStorage").Components.Common.GetWeaponProperties)
+                        local props = GWP(swapTo)
+                        if props then
+                            -- ★ 这里原来直接调 ic.getCurrentEquipped()（无 and 保护），
+                            --   一旦走到就是原版 getfenv 检测。改成 peek。
+                            local peek3 = ic.peekCurrentEquippedForMovement or ic.getCurrentEquipped
+                            local cw = peek3 and peek3()
+                            if cw then
+                                cw.Properties.CharacterAnimations = props.CharacterAnimations
+                                cw.Properties.CameraAnimations = props.CameraAnimations
+                            end
+                        end
+                    end)
+                end
+            end
+
+            local vm = cam and cam:FindFirstChild(wn)
+            -- ⚠ 清掉重复的 viewmodel。
+            -- 重复时「枪身叠在一起、材质互相打架」，而且我们只改得到第一个。
+            if cam and vm then
+                for _, c in ipairs(cam:GetChildren()) do
+                    if c:IsA("Model") and c.Name == wn and c ~= vm then
+                        pcall(function() c:Destroy() end)
+                        S.vmDupRemoved = (S.vmDupRemoved or 0) + 1
+                    end
+                end
+            end
+            if not vm then
+                -- ⚠ viewmodel 丢了要能自己长回来。
+                -- ⚠ 这里**不再**自动重建 viewmodel。
+                -- 之前用 GetCameraModel 建一份挂回 Camera，实测它**不会跟随相机**：
+                -- 游戏对原始 viewmodel 有每帧的 CFrame 绑定，我们新建的没有，
+                -- 结果枪停在原地、玩家走开后只剩空气（有截图）。丢模型就只能切枪/重进。
+                S.skinPoll.skips += 1
+                return
+            end
+            local weapon = vm:FindFirstChild("Weapon") or vm
+
+            -- 目标材质表缓存：GetCameraModel 每把武器/皮肤只调一次（否则每 0.12 秒重建模型）
+            local key = wn .. "|" .. want
+            -- ⚠ 失败熔断：某些枪的 SurfaceAppearance 带 TexturePackContent（引擎烘焙纹理包），
+            -- ColorMap 写入会被静默忽略（赋值成功、值不变、画面不动）。
+            -- 不熔断的话每 0.12 秒都会重写一遍 → 引擎反复重烘焙纹理 → 周期性掉帧。
+            if (S._skinFail and S._skinFail[key] or 0) >= 3 then
+                S.skinPoll.skips += 1
+                return
+            end
+            -- 空来源材质的冷却（见下面 emptySrc 分支）：某些武器/皮肤结构上就取不到材质，
+            -- 这里挡掉，避免 8Hz 反复重建模型。
+            if S._skinEmptyUntil and (S._skinEmptyUntil[key] or 0) > os.clock() then
+                S.skinPoll.skips += 1
+                return
+            end
+            local srcMap = S._matCache[key]
+            if not srcMap then
+                -- ⚠⚠ 这里以前走 lib.GetCameraModel，拿到的是**原皮模板**
+                -- （Stock 和 Luminex 逐部件 ColorMap 完全一样）。
+                -- 外加本循环每 0.12 秒跑一次，于是它一直在把原皮写回 viewmodel，
+                -- 把 paintCurrentModel 刚刷上的真实皮肤覆盖掉 —— 表现就是
+                -- 「点皮肤时立刻对、一秒后自己变回原皮」。
+                -- 必须和 paintCurrentModel 用同一个来源：Assets.Skins 里的真实材质。
+                local m, why = S.getSkinSAMap((S.modelWeaponOf and S.modelWeaponOf(wn)) or wn, want, S.skinWear)
+                if m and next(m) ~= nil then
+                    srcMap = m
+                    S._matCache[key] = srcMap
+                    if S._skinEmpty then S._skinEmpty[key] = 0 end
+                else
+                    S.skinPoll.emptySrc = (S.skinPoll.emptySrc or 0) + 1
+                    S.lastSkinSrcErr = tostring(why)
+                    -- 连续 4 次空 → 这个 key 冷却 20 秒，避免 8Hz 反复重建
+                    S._skinEmpty = S._skinEmpty or {}
+                    local ec = (S._skinEmpty[key] or 0) + 1
+                    S._skinEmpty[key] = ec
+                    if ec >= 4 then
+                        S._skinEmptyUntil = S._skinEmptyUntil or {}
+                        S._skinEmptyUntil[key] = os.clock() + 20
+                        S._skinEmpty[key] = 0
+                        S.skinPoll.emptyBackoff = (S.skinPoll.emptyBackoff or 0) + 1
+                    end
+                    S.skinPoll.skips += 1
+                    return
+                end
+                S.skinPoll.cacheMiss += 1
+            else
+                S.skinPoll.cacheHit += 1
+            end
+            -- ⚠ 目标部件列表缓存：viewmodel 没重建时不必每 0.12 秒 GetDescendants 一次。
+            -- 失效判据三选一：武器实例换了 / 直接子节点数量变了 / 超过 1 秒。
+            -- 中间那条是给「同一个容器里换内部部件」准备的 —— 只靠 2 秒 TTL 的话，
+            -- 那种情况最多会有 2 秒画不上皮肤。GetChildren 只扫直接子级，比全树便宜得多。
+            local childN = #weapon:GetChildren()
+            local partList = S._skinParts
+            if (not partList) or partList.weapon ~= weapon or partList.childN ~= childN
+                or (os.clock() - (partList.at or 0)) > 1 then
+                partList = { weapon = weapon, at = os.clock(), childN = childN, parts = {} }
+                for _, d in ipairs(weapon:GetDescendants()) do
+                    if d:IsA("MeshPart") and not S.SKIN_SKIP[d.Name] then
+                        partList.parts[#partList.parts + 1] = d
+                    end
+                end
+                S._skinParts = partList
+            end
+            local fixed, noEffect = 0, 0
+            for _, d in ipairs(partList.parts) do
+                local t = srcMap[d.Name]
+                if t then
+                    local sa = d:FindFirstChildOfClass("SurfaceAppearance")
+                    if sa then
+                        -- ⚠ 判据是「是否等于目标值」，不是「是否和原值不同」。
+                        -- 用「不同」的话：重复应用同一款皮肤（已经是目标值）会被判成失败，
+                        -- 而且 ColorMap 恰好相同、只有法线/发光不同的皮肤也永远写不进去。
+                        local needWrite = false
+                        if tostring(S.getColorMap(sa)) ~= tostring(t.ColorMap) then
+                            needWrite = true
+                        else
+                            for k, v in pairs(t) do
+                                if v ~= nil and k ~= "ColorMap" then
+                                    if tostring(S.saGet(sa, k)) ~= tostring(v) then
+                                        needWrite = true
+                                        break
+                                    end
+                                end
+                            end
+                        end
+                        if needWrite then
+                            for k, v in pairs(t) do
+                                if v ~= nil then S.saSet(sa, k, v) end
+                            end
+                            -- 写后验证：读回值等于目标才算成功（引擎静默拒收时值不会变）
+                            if tostring(S.getColorMap(sa)) == tostring(t.ColorMap) then
+                                fixed = fixed + 1
+                            else
+                                noEffect = noEffect + 1
+                            end
+                        end
+                    end
+                end
+            end
+            -- ⚠ 熔断判据必须看「有没有写不进的部件」，不能看「这一轮有没有成功过」。
+            -- 原来是 `if fixed > 0 then 清零`：同一把枪上 A 部件写得进、B 部件写不进时，
+            -- 每轮都因为 A 的成功把计数抹掉 —— B 永远熔不断，每 0.12 秒重试一次，
+            -- 引擎每 0.12 秒重烘焙一次纹理。这正是「部分成功的枪持续掉帧」的成因。
+            if fixed > 0 then
+                S.lastSkinPaint = string.format("%s→%s(补写%d)", wn, want, fixed)
+                -- 累计「实际触发了多少次材质赋值」：这是渲染侧开销的代理指标。
+                -- 单看 skinPoll.max（Lua 计时）证明不了不卡 —— 引擎重烘焙发生在赋值之后。
+                S.skinPoll.partsWritten = (S.skinPoll.partsWritten or 0) + fixed
+            end
+            if noEffect > 0 then
+                S._skinFail = S._skinFail or {}
+                S._skinFail[key] = (S._skinFail[key] or 0) + 1
+                S.skinPoll.partsRejected = (S.skinPoll.partsRejected or 0) + noEffect
+                if S._skinFail[key] == 3 then
+                    warn("[skin] " .. tostring(wn)
+                        .. " 有部件材质写入被引擎拒绝（TexturePackContent 烘焙），已停止重试")
+                end
+            elseif S._skinFail and S._skinFail[key] then
+                -- 这一轮没有任何「写了没效果」的部件 → 真正恢复，计数归零
+                S._skinFail[key] = 0
+            end
+        end)
+        -- 放在 pcall 外面：内部任何提前 return 也照样计入一次 tick 的耗时，
+        -- 否则「跳过」的那些帧永远不出现在统计里，看起来总是很便宜。
+        S.skinPoll.tick(t0)
+    end
+end)
+
+-- 独立循环驱动（不依赖主循环的挂载点，避免再被删）
+task.spawn(function()
+    while true do
+        task.wait(0.12)
+        if S._alive == false or (REG and REG.gen ~= MY_GEN) then break end
+        pcall(S.drawWorldItems)
+    end
+end)
 
 ---------------------------------------------------------------------
 -- 主循环（单连接，统一调度）
@@ -9321,7 +12199,7 @@ end
 local acc = 0
 local drawConn = RunService:BindToRenderStep("MV_Draw",
     Enum.RenderPriority.Last.Value, function(dt)
-        if REG.gen ~= MY_GEN then
+        if S._alive == false or REG.gen ~= MY_GEN then
             pcall(function() RunService:UnbindFromRenderStep("MV_Draw") end)
             return
         end
@@ -9392,7 +12270,7 @@ local drawConn = RunService:BindToRenderStep("MV_Draw",
 
 -- Heartbeat 只保留不需要相机的那部分
 local hbConn = RunService.Heartbeat:Connect(function(dt)
-    if REG.gen ~= MY_GEN then
+    if S._alive == false or REG.gen ~= MY_GEN then
         pcall(function() hbConn:Disconnect() end)
         return
     end
@@ -9423,13 +12301,14 @@ local hbConn = RunService.Heartbeat:Connect(function(dt)
     -- 自动兔子跳：每帧检测落地
     if cfg.bunnyhop then pcall(bunnyhopStep) end
 
-    -- ⚠ 跳过拉栓必须放在 Heartbeat（每帧），不能只放在 MV_Draw 的 30fps 节流里。
+    -- ⚠ 只有开了 hyperFire（脚本接管连发）才需要每帧杀拉栓。
     --
-    -- 游戏的拉栓是 self.ShootDelayThread = task.delay(FireRate, ...)。
-    -- shoot() 状态机开头会检查这个字段：非空就 task.cancel 并直接跳到开火判定。
-    -- 我们取消得越勤，能连发的窗口就越多。30fps 只能抓 33ms 的间隙，
-    -- 60fps 的射击循环里会漏掉一半的机会。
-    if cfg.skipFireDelay == true then
+    -- 之前是无条件跟着 skipFireDelay 跑，结果把全自动枪打成单点：
+    -- killShootDelay 每帧 task.cancel(ShootDelayThread) + IsShooting=false，
+    -- 而游戏的全自动连发就靠 IsShooting 维持「正在连射」，每帧打回 false
+    -- 就等于「你松手了」，必须重新按扳机才出下一发。
+    -- 半自动枪感觉不出来（本来每次点就是重新触发），所以只有全自动枪中招。
+    if cfg.skipFireDelay == true and cfg.hyperFire == true then
         pcall(S.killShootDelay)
     end
 
@@ -9441,46 +12320,17 @@ local hbConn = RunService.Heartbeat:Connect(function(dt)
     -- 实测游戏把商店 Frame 改名成 BuyMenuRetired（不是 BuyMenu），
     -- 旧代码 FindFirstChild("BuyMenu") 永远返回 nil → 菜单永远不收 →
     -- 用户表现为「在商店里点任何东西都没反应」。
-    -- 自动重新装备：手上有空但背包里有东西 → 主动 equip（每 0.75 秒）
-    S.reequipTick = (S.reequipTick or 0) + dt
-    if S.reequipTick >= 0.75 then
-        S.reequipTick = 0
-        if cfg.autoReequip ~= false then
-            pcall(S.autoReequip)
-        end
-    end
-
-    -- 自动拾取地上的武器（按价值 / 自定义优先）
-    pcall(function() S.autoPickupStep(dt) end)
 
     S.buyTick = (S.buyTick or 0) + dt
     if S.buyTick >= 0.15 then
         S.buyTick = 0
         pcall(function()
-            if not S.menuScreenGui then
-                -- 菜单的 ScreenGui 在执行器的 gethui() 容器里（CoreGui.RobloxGui.ScreenGui），
-                -- 所以递归找：哪个 ScreenGui 里有一个叫 Base 的 Frame，就是我们的。
-                local roots = {}
-                if typeof(gethui) == "function" then
-                    local okh, h = pcall(gethui)
-                    if okh and h then roots[#roots + 1] = h end
-                end
-                roots[#roots + 1] = game:GetService("CoreGui")
-                for _, rt in ipairs(roots) do
-                    local okd, descs = pcall(function() return rt:GetDescendants() end)
-                    if okd and descs then
-                        for _, d in ipairs(descs) do
-                            if d:IsA("ScreenGui") then
-                                local b = d:FindFirstChild("Base")
-                                if b and b:IsA("Frame") then
-                                    S.menuScreenGui = d
-                                    break
-                                end
-                            end
-                        end
-                    end
-                    if S.menuScreenGui then break end
-                end
+            if not S.menuScreenGui or not S.menuScreenGui.Parent then
+                -- ⚠ 以前这里是「递归找挂着 Base Frame 的 ScreenGui」——
+                -- WindUI 根节点上没有 Base（结构是 WindUI → Window(Folder) → Frame），
+                -- 所以 S.menuScreenGui 永远是 nil，这一段从来没有真正跑起来过。
+                -- 统一走 S.findMenuGui（精确名 WindUI + Base 作为旧库兜底）。
+                S.menuScreenGui = S.findMenuGui()
             end
             local sg = S.menuScreenGui
             if not sg then return end
@@ -9679,70 +12529,315 @@ end
 ---------------------------------------------------------------------
 -- GUI
 ---------------------------------------------------------------------
-local Window = MacLib:Window({
+-- ═══════════════════════════════════════════════════════════════════════
+-- GUI：WindUI（替换 MacLib）
+--
+-- 为什么换：MacLib 的 Section/TabGroup 只暴露创建方法（TabGroup 只有 Tab()，
+-- Section 只有 Toggle/Slider/... 没有 Destroy/Visible），控件建出来就再也拿不到句柄，
+-- 无法做「切换瞄准模式只显示该模式配置」。
+-- WindUI 的每个控件都有 .ElementFrame（Instance）和 .Destroy()，实测 Visible 有效。
+--
+-- 适配器：下面的 S.adaptSection 把 MacLib 的调用风格
+--   sec:Toggle({ Name=..., Default=..., Callback=... }, "Key")
+-- 映射到 WindUI 的
+--   ws:Toggle({ Title=..., Value=..., Callback=... })
+-- 所以业务代码里的 264 个控件一行都不用改。
+-- ═══════════════════════════════════════════════════════════════════════
+-- ⚠ 每次重载都会新建一整套 WindUI，旧的不清掉就会叠加：
+-- 实测到过 4 套、每套 10448 个实例（约 34000 个 GUI 同时在渲染）→ 帧率暴跌。
+do
+    local roots = {}
+    local okh, h = pcall(function() return gethui and gethui() end)
+    if okh and h then roots[#roots+1] = h end
+    roots[#roots+1] = game:GetService("CoreGui")
+    for _, rt in ipairs(roots) do
+        local okd, descs = pcall(function() return rt:GetDescendants() end)
+        if okd and descs then
+            for _, d in ipairs(descs) do
+                if d:IsA("ScreenGui") and tostring(d.Name):find("WindUI") then
+                    pcall(function() d:Destroy() end)
+                end
+            end
+        end
+    end
+end
+-- ⚠ WindUI 源码 1.35MB，每次重载都重新 HttpGet + 编译是整个加载卡死的主因。
+-- 缓存到 getgenv，同一个客户端内只下载一次。
+local _windSrc = getgenv().WINDUI_SRC
+if type(_windSrc) ~= "string" or #_windSrc < 1000 then
+    _windSrc = game:HttpGet("https://raw.githubusercontent.com/Footagesus/WindUI/main/dist/main.lua", true)
+    getgenv().WINDUI_SRC = _windSrc
+end
+local _windFn = loadstring(_windSrc, "WindUI")
+if not _windFn then error("[WindUI] 源码编译失败") end
+local WindUI = _windFn()
+
+local Window = WindUI:CreateWindow({
     Title = "MovementV2 菜单",
-    Subtitle = IS_MOBILE and "手机版" or "v2 | 静默瞄准 + 暴力",
+    Folder = "MovementV2Hub",
     Size = IS_MOBILE and UDim2.fromOffset(560, 560) or UDim2.fromOffset(880, 660),
-    DragStyle = IS_MOBILE and 2 or 1,   -- 手机整窗拖动
-    DisabledWindowControls = {},
-    ShowUserInfo = true,
-    Keybind = IS_MOBILE and Enum.KeyCode.ButtonStart or Enum.KeyCode.RightControl,
-    AcrylicBlur = false,
+    Transparent = true,
+    Resizable = false,
 })
+
+-- 控件登记表：S.UI[key] = WindUI 控件对象（有 .ElementFrame / .Set / .SetTitle）
+S.UI = {}
+
+S.adaptSection = function(ws)
+    local o = {}
+    local function reg(e, key)
+        if key then S.UI[key] = e end
+        return e
+    end
+    function o:Header(t, key) return reg(ws:Paragraph({ Title = tostring(t.Text or "") }), key) end
+    function o:Label(t, key) return reg(ws:Paragraph({ Title = tostring(t.Text or "") }), key) end
+    function o:SubLabel(t, key) return reg(ws:Paragraph({ Title = tostring(t.Text or "") }), key) end
+    function o:Paragraph(t, key) return reg(ws:Paragraph({ Title = tostring(t.Title or t.Header or ""), Desc = tostring(t.Desc or t.Body or "") }), key) end
+    function o:Divider() return ws:Divider() end
+    function o:Spacer() return nil end
+    function o:Toggle(t, key)
+        return reg(ws:Toggle({
+            Title = tostring(t.Name or ""),
+            Value = t.Default == true,
+            Callback = function(v) if t.Callback then t.Callback(v) end end,
+        }), key)
+    end
+    function o:Slider(t, key)
+        local prec = tonumber(t.Precision) or 0
+        return reg(ws:Slider({
+            Title = tostring(t.Name or ""),
+            Value = {
+                Min = tonumber(t.Minimum) or 0,
+                Max = tonumber(t.Maximum) or 100,
+                Default = tonumber(t.Default) or 0,
+            },
+            Step = (prec > 0) and (10 ^ -prec) or 1,
+            Callback = function(v) if t.Callback then t.Callback(v) end end,
+        }), key)
+    end
+    function o:Dropdown(t, key)
+        local opts = {}
+        for i, v in ipairs(t.Options or {}) do opts[i] = tostring(v) end
+        local def = nil
+        if not t.Multi then
+            if type(t.Default) == "number" then def = opts[t.Default]
+            elseif type(t.Default) == "string" then def = t.Default end
+        end
+        return reg(ws:Dropdown({
+            Title = tostring(t.Name or ""),
+            Values = opts,
+            Value = def,
+            Multi = t.Multi == true,
+            SearchBarEnabled = #opts > 8,
+            Callback = function(v) if t.Callback then t.Callback(v) end end,
+        }), key)
+    end
+    function o:Button(t, key)
+        return reg(ws:Button({
+            Title = tostring(t.Name or ""),
+            Callback = function() if t.Callback then t.Callback() end end,
+        }), key)
+    end
+    function o:Keybind(t, key)
+        return reg(ws:Keybind({
+            Title = tostring(t.Name or ""),
+            Value = t.Default,
+            Callback = function(v)
+                if t.Callback then t.Callback(v) end
+                if t.onBinded then t.onBinded(v) end
+            end,
+        }), key)
+    end
+    function o:Colorpicker(t, key)
+        return reg(ws:Colorpicker({
+            Title = tostring(t.Name or ""),
+            Default = t.Default,
+            Callback = function(v) if t.Callback then t.Callback(v) end end,
+        }), key)
+    end
+    function o:Input(t, key)
+        return reg(ws:Input({
+            Title = tostring(t.Name or ""),
+            Value = tostring(t.Default or ""),
+            Callback = function(v) if t.Callback then t.Callback(v) end end,
+        }), key)
+    end
+    return o
+end
+
+local function secOf(tab, title)
+    return S.adaptSection(tab:Section({ Title = title }))
+end
+S.secOf = secOf
+
+-- 兼容：MacLib 的 Window:Notify / Window:Unload
+Window.Notify = function(self, t)
+    pcall(function()
+        WindUI:Notify({
+            Title = tostring((t and t.Title) or ""),
+            Content = tostring((t and (t.Description or t.Content)) or ""),
+            Duration = tonumber(t and t.Lifetime) or 4,
+        })
+    end)
+end
+Window.Unload = function(self)
+    -- ⚠ 只做两件事：停掉本实例的常驻循环、销毁 GUI。
+    --
+    -- 之前这里还会经 getgenv().MV_FULL_CLEANUP 调一次 fullCleanup，风险太高：
+    -- fullCleanup 会同时做「clearEsp 批量 Remove Drawing」「reap 再遍历一遍」
+    -- 「WindUI:Destroy 销毁上万个实例」「还原全部 hook」，几件事挤在同一帧，
+    -- 对执行器的渲染/Drawing 层压力很大。停循环不需要这些 —— 那些留给
+    -- 卸载脚本（它是独立执行、无 GUI 竞争）或重载来做。
+    S._alive = false
+    pcall(function() self:Destroy() end)
+    pcall(function() WindUI:Destroy() end)
+    -- 立即做纯本地收尾（断连接 / 解绑 RenderStep / 清 Drawing）。
+    -- 完整清理（还原 hook）由备用存活检测在 1 秒后执行 —— 错开 WindUI 销毁的尖峰，
+    -- 之前把两件事挤在同一帧时，怀疑就是客户端直接消失的可疑点之一。
+    local soft = getgenv().MV_SOFT_CLEANUP
+    if type(soft) == "function" then pcall(soft) end
+end
+-- 手机缩放：以前是空函数，`Window:SetScale(0.9)` 什么也没做（窄屏会裁切）。
+-- 做法是给主窗口 Frame 挂一个 UIScale，而不是改 Size —— WindUI 自己会用 Size 做布局。
+Window.SetScale = function(self, v)
+    local scale = tonumber(v) or 1
+    pcall(function()
+        local f = S.getMainWindowFrame and S.getMainWindowFrame()
+        if not f then
+            local hh = (gethui and gethui()) or game:GetService("CoreGui")
+            local sg = hh:FindFirstChild("WindUI")
+            local win = sg and sg:FindFirstChild("Window")
+            f = win and win:FindFirstChild("Frame")
+        end
+        if not f or not f:IsA("GuiObject") then return end
+        local us = f:FindFirstChildOfClass("UIScale")
+        if not us then
+            us = Instance.new("UIScale")
+            us.Parent = f
+        end
+        us.Scale = math.clamp(scale, 0.5, 1.5)
+        S.windowScale = us.Scale
+    end)
+end
+-- MacLib 专有方法：返回「窗口当前是否开着」。Toggle / 备用存活检测都靠它。
+--
+-- ⚠ 这里原来是 `return ok and (c ~= true) or true` —— Lua 的 and/or 短路让
+-- 三个分支全部落到最后的 `or true`：窗口关着（Closed == true）也返回 true。
+-- 于是 Toggle 永远认为"当前是开的" → 永远只调 SetState(false) →
+-- 按快捷键只能关、再按也还是关，菜单再也打不开。
+Window.GetState = function(self)
+    -- ① 以真实 ScreenGui.Enabled 为准：SetState 改的就是它，这是唯一权威状态。
+    -- 缓存失效（没找到 / 已被销毁）就重找一次，避免整个会话卡在 Closed 字段上。
+    local sg = S.menuScreenGui
+    if sg then
+        local okP, parent = pcall(function() return sg.Parent end)
+        if (not okP) or parent == nil then sg = nil end
+    end
+    if not sg and S.findMenuGui then
+        sg = S.findMenuGui()
+        if sg then S.menuScreenGui = sg end
+    end
+    if sg then
+        local okE, en = pcall(function() return sg.Enabled end)
+        if okE and en ~= nil then return en == true end
+    end
+    -- ② 退一步读 WindUI 自己的 Closed 字段（true = 已关闭）
+    local okC, c = pcall(function() return self.Closed end)
+    if okC and c ~= nil then return c ~= true end
+    -- ③ 都读不到：当作"还开着"。这里必须偏向 true，
+    -- 因为备用检测会把「返回 false」当成窗口已失效，误判会把脚本自己卸掉。
+    return true
+end
+Window.Toggle = function(self)
+    pcall(function()
+        if self.Closed then
+            if type(self.Open) == "function" then self:Open() end
+        else
+            if type(self.Close) == "function" then self:Close() end
+        end
+    end)
+end
+Window.SetState = function(self, v)
+    -- 真正控制显隐：直接切 WindUI 的 ScreenGui.Enabled（关掉时同时调原生 Close）
+    pcall(function()
+        local roots = {}
+        local okh, h = pcall(function() return gethui and gethui() end)
+        if okh and h then roots[#roots+1] = h end
+        roots[#roots+1] = game:GetService("CoreGui")
+        for _, rt in ipairs(roots) do
+            local okd, descs = pcall(function() return rt:GetDescendants() end)
+            if okd and descs then
+                for _, d in ipairs(descs) do
+                    if d:IsA("ScreenGui") and tostring(d.Name):find("WindUI") then
+                        d.Enabled = (v ~= false)
+                    end
+                end
+            end
+        end
+    end)
+    if v == false then
+        pcall(function() if type(self.Close) == "function" then self:Close() end end)
+    else
+        -- ⚠ 重新显示时必须把 WindUI 内部窗口状态也打开。
+        -- Close() 除了隐藏，还会把库内部的 window 标成已关闭；只把 ScreenGui.Enabled
+        -- 置回 true 的话，会变成「快捷键切了、GetState 说开着、窗口却没回来」。
+        pcall(function() if type(self.Open) == "function" then self:Open() end end)
+    end
+end
+-- ⚠ 以前这里是两行完全相同的 `return UDim2.fromOffset(880, 660)`（重复定义，后者覆盖前者）。
+-- 手机上也返回 PC 尺寸，导致任何按这个值布局的地方在窄屏上溢出。
+Window.GetSize = function(self)
+    if IS_MOBILE then return UDim2.fromOffset(420, 320) end
+    return UDim2.fromOffset(880, 660)
+end
 
 if IS_MOBILE then
     pcall(function() Window:SetScale(0.9) end)
 end
 
--- 窗口居中修正
--- Maclib 的 Base 用的是 AnchorPoint(0.5,0.5) + Position(0.5,-1004 / 0.5,+344)，
--- 那个像素偏移会把整窗推到屏幕外（实测 pos.X = -484）。加载后强制拉回中央。
+-- 窗口居中：⚠ 必须同时设 AnchorPoint。
+-- 原来只写 `Position = UDim2.fromScale(0.5, 0.5)`，锚点还是默认 (0,0)，
+-- 等于把**左上角**放到屏幕正中 —— 窗口看起来偏到右下角、越往右越出屏。
+--
+-- 另外它自己的查找条件也永远是 nil：要求 `d.Parent:IsA("ScreenGui")`，
+-- 而 WindUI 的 Frame 挂在 `WindUI → Window(Folder)` 下面，父级是 Folder。
+-- 直接用已经修好的 S.getMainWindowFrame（它按 WindUI/Window/Frame 这条链找）。
 local function centerWindow()
-    local cg = game:GetService("CoreGui")
-    for _, d in ipairs(cg:GetDescendants()) do
-        if d:IsA("Frame") and d.Name == "Base"
-            and d.Parent and d.Parent:IsA("ScreenGui") then
-            d.Position = UDim2.fromScale(0.5, 0.5)
-            return true
-        end
+    local f = S.getMainWindowFrame and S.getMainWindowFrame()
+    if not f then
+        local hh = (gethui and gethui()) or game:GetService("CoreGui")
+        local sg = hh:FindFirstChild("WindUI")
+        local win = sg and sg:FindFirstChild("Window")
+        f = win and win:FindFirstChild("Frame")
     end
-    return false
+    if not f or not f:IsA("GuiObject") then return false end
+    pcall(function() f.AnchorPoint = Vector2.new(0.5, 0.5) end)
+    f.Position = UDim2.fromScale(0.5, 0.5)
+    return true
 end
+S.centerWindow = centerWindow
 
-task.spawn(function()
-    for _ = 1, 8 do
-        task.wait(0.25)
-        if REG.gen ~= MY_GEN then return end
-        if centerWindow() then break end
-    end
-end)
-
-local TG = Window:TabGroup()
 local T = {
-    combat = TG:Tab({ Name = "战斗", Image = "rbxassetid://18821914323" }),
-    rage = TG:Tab({ Name = "暴力", Image = "rbxassetid://10747373183" }),
-    visual = TG:Tab({ Name = "视觉", Image = "rbxassetid://10734950309" }),
-    weapon = TG:Tab({ Name = "武器", Image = "rbxassetid://10747373183" }),
-    -- VIP 服务器专属能力单独一页（只在私人服/有 VIP 权限时可用）
-    vip = TG:Tab({ Name = "VIP服", Image = "rbxassetid://10747373183" }),
-    -- 美化（皮肤/外观）单独一页，纯本地视觉
-    skin = TG:Tab({ Name = "美化", Image = "rbxassetid://10734950309" }),
-    misc = TG:Tab({ Name = "杂项", Image = "rbxassetid://10734950569" }),
+    combat = Window:Tab({ Title = "战斗" }),
+    rage   = Window:Tab({ Title = "暴力" }),
+    visual = Window:Tab({ Title = "视觉" }),
+    weapon = Window:Tab({ Title = "武器" }),
+    vip    = Window:Tab({ Title = "VIP服" }),
+    skin   = Window:Tab({ Title = "美化" }),
+    misc   = Window:Tab({ Title = "杂项" }),
 }
 
--- VIP 页：服务端管理接口（无限弹药/金钱/无敌/BOT 控制/结算动作）
--- 注意：这里不能声明新的顶层 local（主 chunk 已经 200 上限），所以挂到 T 上。
-T.vipL = T.vip:Section({ Side = "Left" })
-T.vipR = T.vip:Section({ Side = "Right" })
--- 美化页：皮肤切换（只影响自己客户端看到的枪）
-T.skinL = T.skin:Section({ Side = "Left" })
-T.skinR = T.skin:Section({ Side = "Right" })
+T.vipL = secOf(T.vip, "VIP 设置")
+T.vipR = secOf(T.vip, "VIP 动作")
+T.skinL = secOf(T.skin, "皮肤")
+T.skinR = secOf(T.skin, "说明")
 
 -- 战斗
-local cl = T.combat:Section({ Side = "Left" })
-local cr = T.combat:Section({ Side = "Right" })
+local cl = secOf(T.combat, "瞄准与射击")
+local cr = secOf(T.combat, "目标与过滤")
+getgenv().MV_DBG_SECTIONS = { combatL = cl, combatR = cr }
 
-cl:Header({ Text = "静默瞄准" })
+cl:Header({ Text = "【仅静默模式】静默瞄准" })
 -- ⚠ Default 必须读 cfg，不能写死 false。
 -- Maclib 初始化控件时会用 Default 回写一次 Callback：写死 false 就意味着
 -- 每次加载都把「存档里开着的静默」在视觉和逻辑上各冲一遍，而 GUI 建完之后
@@ -9792,8 +12887,19 @@ cl:Dropdown({
         else
             cfg.aimMode = "mouse"
         end
+        -- 切换后直接告诉用户「现在只用看哪一段」，其余段都标了【仅XX模式】可以忽略
+        pcall(function()
+            local tip = "【静默】下面只需要看「【仅静默模式】」那一段（360°/部位/距离），其它带【仅平滑/仅鼠标】的都可以忽略"
+            if cfg.aimMode == "smooth" then
+                tip = "【平滑】下面只需要看「【仅平滑模式】」那一段（速度/抖动/延迟/过冲），其它忽略"
+            elseif cfg.aimMode == "mouse" then
+                tip = "【鼠标】下面只需要「鼠标瞄准 增益 / 每帧最大移动 / 平滑 / 手动暂停」四项，其它忽略"
+            end
+            S.aimModeTip:UpdateName("当前生效：" .. tip)
+        end)
     end,
 }, "AimMode")
+S.aimModeTip = cl:Label({ Text = "当前生效：【静默】下面只需要看「【仅静默模式】」那一段（360°/部位/距离），其它带【仅平滑/仅鼠标】的都可以忽略" })
 cl:Toggle({ Name = "360° 静默（屏幕外也锁）", Default = cfg.fullSphere == true,
     Callback = function(v) cfg.fullSphere = v end }, "FullSphere")
 cl:Label({ Text = "静默只改子弹方向、不转视角，所以「目标在不在画面里」这条限制没有意义。打开后只保留距离和视线通畅两条约束——身后、墙侧的目标一样能锁。" })
@@ -9801,15 +12907,15 @@ cl:Slider({ Name = "鼠标瞄准 增益", Default = 0.12, Minimum = 0.02, Maximu
     Callback = function(v) cfg.mouseGain = v end }, "MouseGain")
 cl:Slider({ Name = "鼠标瞄准 每帧最大移动", Default = 12, Minimum = 1, Maximum = 60, DisplayMethod = "Value", Precision = 0,
     Callback = function(v) cfg.mouseMaxStep = v end }, "MouseStep")
-cl:Slider({ Name = "鼠标瞄准 平滑", Default = 0.55, Minimum = 0, Maximum = 0.95, DisplayMethod = "Value", Precision = 2,
+cl:Slider({ Name = "鼠标瞄准 平滑（仅鼠标模式）", Default = 0.55, Minimum = 0, Maximum = 0.95, DisplayMethod = "Value", Precision = 2,
     Callback = function(v) cfg.mouseSmooth = v end }, "MouseSmooth")
 cl:Slider({ Name = "鼠标瞄准 手动操作后暂停(秒)", Default = 0.6, Minimum = 0.1, Maximum = 3, DisplayMethod = "Value", Precision = 1,
     Callback = function(v) cfg.mouseReleaseDelay = v end }, "MouseRelease")
-cl:Label({ Text = "「鼠标瞄准」用 mousemoverel 发真实鼠标输入，游戏相机会正常响应——这是唯一能真正转动视角的方式。" })
-cl:Label({ Text = "⚠ 它会真的移动系统光标。所以只要检测到任何真实键鼠操作（按键、左右键），就暂停一段时间让你能操作菜单、切窗口、按 Esc。窗口失焦时也会自动停。" })
+cl:Label({ Text = "「鼠标瞄准」用 mousemoverel 发真实鼠标输入，游戏相机会正常响应——这是唯一能真正转动视角的方式。" }, "MouseTip1")
+cl:Label({ Text = "⚠ 它会真的移动系统光标。所以只要检测到任何真实键鼠操作（按键、左右键），就暂停一段时间让你能操作菜单、切窗口、按 Esc。窗口失焦时也会自动停。" }, "MouseTip2")
 cl:Label({ Text = "抖动的原因：增益太高会过冲——这一帧转过头、下一帧反向拉回，两帧一循环就成了肉眼可见的抖。默认 0.12 + 每帧上限 12px + 指数平滑，基本是单调逼近不抖。如果还抖就继续降增益、调高平滑。" })
 
-cl:Header({ Text = "平滑瞄准（真正转视角）" })
+cl:Header({ Text = "【仅平滑模式】平滑瞄准" })
 cl:Toggle({ Name = "平滑瞄准（转视角·不抢鼠标·推荐）", Default = cfg.smoothAimHijack == true, Callback = function(v)
     cfg.smoothAimHijack = v
     if v then
@@ -9826,19 +12932,21 @@ cl:Toggle({ Name = "平滑瞄准（转视角·不抢鼠标·推荐）", Default 
 end }, "SmoothHijack")
 cl:Slider({ Name = "平滑瞄准 抖动(度)", Default = 0, Minimum = 0, Maximum = 2, DisplayMethod = "Value", Precision = 2,
     Callback = function(v) cfg.smoothAimJitter = v end }, "SmoothJitter")
-cl:Slider({ Name = "平滑瞄准 速度", Default = 0.12, Minimum = 0.02, Maximum = 1, DisplayMethod = "Value", Precision = 2,
+-- ⚠ 滑条下限必须和 hook 里的 clamp 下限一致，否则「滑条拖到底还是硬锁」——
+--   这就是用户说的「不兼容人性化设置」：代码 clamp 一次、滑条再夹一次。
+cl:Slider({ Name = "平滑瞄准 速度", Default = 0.18, Minimum = 0.005, Maximum = 1, DisplayMethod = "Value", Precision = 3,
     Callback = function(v) cfg.smoothAimSpeed = v end }, "SmoothSpeed")
-cl:Slider({ Name = "平滑瞄准 每帧最大转角", Default = 1.5, Minimum = 0.2, Maximum = 5, DisplayMethod = "Value", Precision = 1,
+cl:Slider({ Name = "平滑瞄准 每帧最大转角", Default = 2.0, Minimum = 0.01, Maximum = 5, DisplayMethod = "Value", Precision = 2,
     Callback = function(v) cfg.smoothAimMaxDeg = v end }, "SmoothMaxDeg")
-cl:Slider({ Name = "平滑瞄准 死区(度)", Default = 0.3, Minimum = 0, Maximum = 3, DisplayMethod = "Value", Precision = 2,
+cl:Slider({ Name = "平滑瞄准 死区(度)", Default = 0.6, Minimum = 0, Maximum = 3, DisplayMethod = "Value", Precision = 2,
     Callback = function(v) cfg.smoothAimDeadzone = v end }, "SmoothDead")
-cl:Slider({ Name = "平滑瞄准 瞄点下移", Default = 0.9, Minimum = 0, Maximum = 3, DisplayMethod = "Value", Precision = 1,
+cl:Slider({ Name = "平滑瞄准 瞄点下移", Default = 2.2, Minimum = 0, Maximum = 4, DisplayMethod = "Value", Precision = 1,
     Callback = function(v) cfg.smoothAimDrop = v end }, "SmoothDrop")
 cl:Label({ Text = "原理：CameraController 每帧调用 AimAssistController.GetMagnetismRotation()，拿到 Vector2(水平角, 垂直角) 后 clamp 到 ±5 度再应用到相机。这里把那个函数换成「返回指向目标的角度差」，相机就被游戏自己每帧转过去。" })
-cl:Label({ Text = "和另外两种的区别：改 cam.CFrame 会被每帧覆盖（实测 384 帧写 0 度变化）；mousemoverel 会抢你的鼠标。这条走引擎内部管道，既不覆盖也不碰鼠标。" })
+cl:Label({ Text = "和另外两种的区别：改 cam.CFrame 会被每帧覆盖（实测 384 帧写 0 度变化）；mousemoverel 会抢你的鼠标。这条走引擎内部管道，既不覆盖也不碰鼠标。" }, "MouseTip3")
 cl:Label({ Text = "实测：1.2 秒内相机转了 6.66 度，目标从屏幕外（Z=118）进到正前方（Z=11）。每帧上限 5 度，60fps 就是 300 度/秒。" })
 
-cl:Header({ Text = "原生瞄准辅助（游戏自带）" })
+cl:Header({ Text = "【通用·与模式无关】原生瞄准辅助（游戏自带）" })
 cl:Toggle({ Name = "解锁原生瞄准辅助（后坐力减半 + 磁性吸附）", Default = cfg.nativeAimAssist == true, Callback = function(v)
     cfg.nativeAimAssist = v
     if v then
@@ -9872,7 +12980,7 @@ cl:Label({ Text = "点上面的按钮再按一个键即可改绑。触发方式�
 task.spawn(function()
     while true do
         task.wait(0.4)
-        if REG.gen ~= MY_GEN then break end
+        if S._alive == false or REG.gen ~= MY_GEN then break end
         pcall(function()
             local txt = "瞄准按键: " .. aimInputLabel()
             if aimInput.listening then txt = txt .. "   [等待按键...]" end
@@ -9880,7 +12988,7 @@ task.spawn(function()
         end)
     end
 end)
-cl:Slider({ Name = "视野范围 FOV", Default = (cfg.fov or 250), Minimum = 20, Maximum = 2400, DisplayMethod = "Value", Precision = 0,
+cl:Slider({ Name = "视野范围 FOV", Default = (cfg.fov or 75), Minimum = 20, Maximum = 2400, DisplayMethod = "Value", Precision = 0,
     Callback = function(v) cfg.fov = v end }, "Fov")
 cl:Toggle({ Name = "显示 FOV 圈", Default = true, Callback = function(v) cfg.showFov = v end }, "ShowFov")
 cl:Colorpicker({ Name = "FOV 圈颜色", Default = Color3.fromRGB(255, 255, 255),
@@ -9928,7 +13036,7 @@ cl:Toggle({ Name = "纯净模式（关掉所有 hook 和改写）", Default = fa
 end }, "PureMode2")
 cl:Label({ Text = "如果开了这个之后商店能买、捡东西不消失 → 确定是脚本里某个功能导致；关掉再逐项打开就能定位。如果纯净模式依然买不了 → 那是游戏/服务端的问题，跟脚本无关。" })
 
-cr:Header({ Text = "目标优先级" })
+cr:Header({ Text = "【通用·所有模式生效】目标优先级 / 距离 / 部位" })
 cr:Dropdown({
     Name = "选人策略",
     Multi = false,
@@ -9977,7 +13085,7 @@ cr:Slider({ Name = "最长锁定(秒)", Default = 6, Minimum = 1, Maximum = 30, 
 cr:Label({ Text = "锁定后不会因为旁边出现人而换目标，打死当前目标或他自己离开视野才切换。你手动滑屏/移动鼠标会立刻解锁。" })
 
 cr:Header({ Text = "人体化（防封）" })
-cr:Slider({ Name = "平滑度（越大越慢）", Default = 0.22, Minimum = 0.02, Maximum = 1.0, DisplayMethod = "Value", Precision = 2,
+cr:Slider({ Name = "人体化·指数平滑（越大越慢，与上面「鼠标瞄准 平滑」无关）", Default = 0.22, Minimum = 0.02, Maximum = 1.0, DisplayMethod = "Value", Precision = 2,
     Callback = function(v) cfg.smoothness = v end }, "Smoothness")
 cr:Slider({ Name = "手抖强度", Default = 0.35, Minimum = 0, Maximum = 3, DisplayMethod = "Value", Precision = 2,
     Callback = function(v) cfg.jitter = v end }, "Jitter")
@@ -10000,7 +13108,7 @@ cr:Dropdown({
         else cfg.aimHitPart = "auto" end
     end,
 }, "AimHitPart")
-cr:Toggle({ Name = "部位优先级（露哪打哪）", Default = true, Callback = function(v) cfg.aimPartPriority = v end }, "AimPartPrio")
+cr:Toggle({ Name = "自动选可见部位（仅在「静默打哪个部位=自动」时生效）", Default = cfg.aimPartPriority == true, Callback = function(v) cfg.aimPartPriority = v end }, "AimPartPrio")
 cr:Label({ Text = "「静默打哪个部位」选自动时，才轮到下面的部位优先级/瞄头概率。以前静默硬编码打头，这三个配置对它完全无效——已修。" })
 cr:Label({ Text = "部位优先级开启时忽略上面的瞄头概率：按 头 → 脖子/胸 → 腹 → 上臂 → 前臂 → 手 → 大腿 → 小腿 → 脚 的顺序，选第一个没被遮挡的部位。全身都被挡住时退回头部（用于透视预测）。" })
 cr:Toggle({ Name = "过冲回拉", Default = true, Callback = function(v) cfg.overshoot = v end }, "Overshoot")
@@ -10019,8 +13127,8 @@ cr:Paragraph({
 })
 
 -- 暴力
-local rl = T.rage:Section({ Side = "Left" })
-local rr = T.rage:Section({ Side = "Right" })
+local rl = secOf(T.rage, "实验项（多为实测无效）")
+local rr = secOf(T.rage, "开火 · 弹药 · 投掷")
 
 rl:Header({ Text = "⚠ 以下为实测无效（保留开关仅供验证）" })
 rl:Toggle({ Name = "【无效】子弹追踪（起点搬到目标身上）", Default = cfg.bulletTrack == true, Callback = function(v)
@@ -10093,12 +13201,17 @@ end }, "NoRecoil")
 rr:Label({ Text = "拦的是 CameraController.setWeaponRecoil —— 每次开枪游戏把后座值灌进弹簧，这个函数不让它灌。子弹扩散不受影响，只是镜头不再跳。" })
 rr:Toggle({ Name = "自动压枪", Default = cfg.autoRecoilComp == true, Callback = function(v)
     cfg.autoRecoilComp = v
+    S._recoilLastKick = Vector3.new(0, 0, 0)
     Window:Notify({ Title = "后座", Description = "自动压枪 " .. (v and "已开启" or "已关闭"), Lifetime = 2 })
 end }, "AutoRecoilComp")
-rr:Slider({ Name = "压枪幅度（%）", Default = cfg.recoilCompPercent, Minimum = 0, Maximum = 100,
+-- ⚠ 垂直/水平必须分开：垂直是每发固定往上顶，可以压满；水平方向随机，压满会显得锁死。
+rr:Slider({ Name = "垂直压枪（%）", Default = cfg.recoilCompV or 100, Minimum = 0, Maximum = 100,
     DisplayMethod = "Value", Precision = 0,
-    Callback = function(v) cfg.recoilCompPercent = v end }, "RecoilCompPct")
-rr:Label({ Text = "每帧读 getWeaponKickRotation（弹簧当前后座偏移），按百分比反向补到相机上。100% = 完全压平，50% = 压一半，保留一点真实手感。埋点 state.recoilCompSteps。" })
+    Callback = function(v) cfg.recoilCompV = v; S._recoilLastKick = Vector3.new(0, 0, 0) end }, "RecoilCompV")
+rr:Slider({ Name = "水平压枪（%）", Default = cfg.recoilCompH or 60, Minimum = 0, Maximum = 100,
+    DisplayMethod = "Value", Precision = 0,
+    Callback = function(v) cfg.recoilCompH = v; S._recoilLastKick = Vector3.new(0, 0, 0) end }, "RecoilCompH")
+rr:Label({ Text = "每帧读 getWeaponKickRotation（弹簧当前后座偏移），把「当前值」整个反向压回相机。0.00° 实测确认：游戏每帧都会重建相机，我们上一帧的补偿不会保留 —— 所以必须每帧抵消当前值，补「变化量」是无效的（那正是「弹道压住了、准星还在飞」的原因）。垂直默认 100%，水平默认 60%（水平方向随机，压满不自然）。埋点 state.recoilCompSteps / state._recoilCompAccum。" })
 
 rr:Header({ Text = "近战 · 超距离" })
 rr:Slider({ Name = "近战射程倍数", Default = cfg.meleeRange, Minimum = 1, Maximum = 10, DisplayMethod = "Value", Precision = 1,
@@ -10381,32 +13494,95 @@ end }, "VipEndGame")
 T.vipR:Label({ Text = "危险动作，只在你自己的服务器里用。EndGame 会直接结束本局。" })
 
 -- ═══════════════════════════════════════════════════════════════
--- 美化（独立页 T.skin）—— 纯本地视觉，服务端不认
+-- 美化功能已整体移除（按用户要求）
+-- 历史结论：这个游戏的皮肤在未导出的 DecorateModel / GetSkinTextureFolder 里套，
+-- 客户端只能改 MeshPart.TextureID（UV 对不上，出灰白/错位），写 CurrentEquipped 会被
+-- 服务端覆盖，destroy+construct 会弄坏 viewmodel。所以不再提供入口。
 -- ═══════════════════════════════════════════════════════════════
-T.skinL:Header({ Text = "武器皮肤（已禁用）" })
+T.skinL:Header({ Text = "皮肤（全部可美化武器 + 手套）" })
+
+-- ⚠ 为什么用「固定槽位」而不是动态增删控件：
+-- WindUI 的控件只能在加载时创建，运行时新增不了。所以预先建 26 个槽位按钮，
+-- 由 S.refreshSkinList() 把「当前手持武器」的皮肤按品质排序后填进标题，
+-- 空槽位标题设为 "—" 并且不可点。换枪由轮询自动触发刷新。
+S.skinSlotCB = {}
+for i = 1, 52 do
+    (function(slot)
+        T.skinL:Button({
+            Name = "—",
+            Callback = function()
+                local cb = S.skinSlotCB[slot]
+                if cb then cb() end
+            end,
+        }, "SkinSlot" .. slot)
+    end)(i)
+end
 T.skinL:Button({
-    Name = "切换皮肤（会破坏背包，已停用）",
+    -- ⚠ 文案要准确：这个按钮重扫的是「哪些武器有皮肤」这张名字表，
+    -- 不是「当前手上这把枪的皮肤列表」（后者在点名字打开的图鉴面板里，每次现取）。
+    Name = "↻ 重新扫描武器列表（漏枪时用）",
     Callback = function()
-        Window:Notify({
-            Title = "换肤已停用",
-            Description = "写 CurrentEquipped 会让服务端背包同步失效：买东西不进、捡东西消失、主武器切不出来。",
-            Lifetime = 8,
-        })
+        local ok, msg = S.refreshSkinList(true)
+        Window:Notify({ Title = "武器列表", Description = tostring(msg), Lifetime = 4 })
     end,
-}, "SkinCycle")
+}, "SkinRefreshList")
 T.skinL:Button({
-    Name = "列出当前武器的皮肤名（只读）",
+    Name = "↺ 恢复原皮（当前武器/手套）",
     Callback = function()
-        local list = S.listSkins()
         local cur = S.getCurrentWeapon()
+        if not cur then return end
+        S.setSkin(cur.Name, "Stock")
+        S.paintCurrentModel(tostring(cur.Name), "Stock")
+    end,
+}, "SkinStockReset")
+
+-- 手动强制重建 viewmodel：换完皮肤画面没变时点一下
+T.skinL:Button({
+    Name = "↻ 强制刷新皮肤（换了没反应时点我）",
+    Callback = function()
+        local cur = S.getCurrentWeapon()
+        if not cur then
+            Window:Notify({ Title = "刷新", Description = "手上没有武器", Lifetime = 3 })
+            return
+        end
+        -- 先重刷一次材质，再让游戏重建 viewmodel
+        local skin = S.skinPaint and S.skinPaint[tostring(cur.Name)]
+        if skin then
+            pcall(S.paintCurrentModel, tostring(cur.Name), tostring(skin))
+        end
+        local ok, why = S.rebuildViewmodel(tostring(cur.Name))
         Window:Notify({
-            Title = "皮肤列表（" .. tostring(cur and cur.Name) .. "）",
-            Description = (#list > 0) and table.concat(list, " / ") or "该武器没有可选皮肤",
-            Lifetime = 8,
+            Title = ok and "已请求重建" or "重建失败",
+            Description = ok and ("重新加载 " .. tostring(cur.Name)) or tostring(why),
+            Lifetime = 3,
         })
     end,
-}, "SkinList")
-T.skinL:Label({ Text = "换肤功能已停用。原因：它靠本地改写 CurrentEquipped 属性实现，而这个属性是服务端下发的武器数据，游戏所有背包/拾取/购买逻辑都读它。改了之后旧武器切不出来、新买的东西不进来、捡到的立刻消失。想看皮肤名可以点下面的只读按钮。" })
+}, "SkinForceRefresh")
+
+-- ⚠ 磨损等级必须能选。
+-- 每款皮肤在 Assets.Skins 里按磨损分 1~5 个文件夹，同款皮肤不同磨损的 ColorMap 完全不同：
+--   Luminex: Factory New=89358060595291 / Battle-Scarred=122213807151929
+-- 默认用 Factory New（和图鉴预览一致）。之前取的是文件夹里的第一个，
+-- 而多数皮肤第一个是 Battle-Scarred —— 刷上去就是"严重磨损版"，用户一眼看出不对。
+T.skinL:Dropdown({
+    Name = "磨损等级（影响皮肤外观新旧）",
+    Options = { "Factory New", "Minimal Wear", "Field-Tested", "Well-Worn", "Battle-Scarred" },
+    Default = 1,
+    Callback = function(v)
+        S.skinWear = tostring(v)
+        S._matCache = {}          -- 材质缓存按磨损分级，换磨损必须整体作废
+        S._skinFail = {}
+        S._skinEmptyUntil = {}
+        S._skinParts = nil
+        local cur = S.getCurrentWeapon()
+        if cur and S.skinPaint[cur.Name] then
+            S.paintCurrentModel(tostring(cur.Name), tostring(S.skinPaint[cur.Name]))
+        end
+        Window:Notify({ Title = "磨损", Description = "已切换为 " .. tostring(v), Lifetime = 3 })
+    end,
+}, "SkinWear")
+
+T.skinL:Label({ Text = "列表会自动跟随你手里拿的东西：拿枪显示那把枪的皮肤，拿刀/手雷/C4 时自动改为手套皮肤。按品质从高到低排序（红 > 粉 > 紫 > 蓝 > 原版），点任意一行立即换肤。" })
 
 rr:Dropdown({
     Name = "空中加速（air strafe 实验）",
@@ -10430,8 +13606,8 @@ rr:Slider({ Name = "基础速度倍率（实验）", Default = cfg.bhopBoost, Mi
     Callback = function(v) cfg.bhopBoost = v end }, "BhopBoost")
 
 -- 视觉
-local vl = T.visual:Section({ Side = "Left" })
-local vr = T.visual:Section({ Side = "Right" })
+local vl = secOf(T.visual, "显示与透视")
+local vr = secOf(T.visual, "颜色 / 范围 / 大小")
 
 vl:Header({ Text = "透视" })
 vl:Toggle({ Name = "透视开关", Default = true, Callback = function(v) cfg.esp = v end }, "Esp")
@@ -10439,7 +13615,7 @@ vl:Toggle({ Name = "方框", Default = true, Callback = function(v) cfg.espBox =
 vl:Toggle({ Name = "血条", Default = true, Callback = function(v) cfg.espHealth = v end }, "EspHp")
 vl:Toggle({ Name = "名字", Default = true, Callback = function(v) cfg.espName = v end }, "EspName")
 vl:Toggle({ Name = "骨骼", Default = cfg.espSkeleton == true, Callback = function(v) cfg.espSkeleton = v end }, "EspSkel")
-vl:Toggle({ Name = "碰撞箱部位", Default = cfg.espHitbox == true, Callback = function(v) cfg.espHitbox = v end }, "EspHitbox")
+-- 「碰撞箱部位」开关已按用户要求移除
 vl:Toggle({ Name = "敌人高亮（暴露/掩体后分色）", Default = cfg.espCoverTint == true, Callback = function(v)
     cfg.espCoverTint = v
     coverCache = {}
@@ -10582,57 +13758,25 @@ vr:Button({
 }, "ThrowFeel")
 vr:Toggle({ Name = "自动校准起点（旧的相机锚点法，建议关）", Default = cfg.throwAutoCalibrate, Callback = function(v) cfg.throwAutoCalibrate = v end }, "ThrowAutoCal")
 -- 武器分类：每类枪单独设最大开火距离
-local wl = T.weapon:Section({ Side = "Left" })
-local wr = T.weapon:Section({ Side = "Right" })
+local wl = secOf(T.weapon, "装备与武器")
+local wr = secOf(T.weapon, "各类武器参数")
 
--- ── 装备修复（原来挂在「战斗」页，用户要求归到武器页） ──
-wl:Header({ Text = "装备：手上空着 / 买了不进去" })
-wl:Toggle({ Name = "自动重新装备（推荐开）", Default = (cfg.autoReequip ~= false), Callback = function(v)
-    cfg.autoReequip = v
-    Window:Notify({
-        Title = v and "自动重新装备 已开启" or "自动重新装备 已关闭",
-        Description = v and "背包里有武器但手上是空的时，每 0.75 秒自动装备一次"
-            or "关闭后需要手动点下面的按钮",
-        Lifetime = 5,
-    })
-end }, "AutoReequip")
-wl:Button({ Name = "立即重新装备（手动）", Callback = function()
-    local ok, msg = S.autoReequip()
-    Window:Notify({
-        Title = ok and "已重新装备" or "没有可装备的东西",
-        Description = tostring(msg),
-        Lifetime = 5,
-    })
-end }, "ReequipNow")
-wl:Label({ Text = "判定优先级（实测）：先看手上有没有东西 —— 有就完全不动；"
-    .. "手上真的空着时，才按 Slot1 → Slot5 找第一个有物品的槽装备（所以是主武器优先，不会去装手雷/刀）。"
-    .. "另外加了一道保护：只要手上拿着投掷物（Class=Grenade），一律不动作。" })
-wl:Label({ Text = "症状：回合开始后商店能点、有音效、属性面板也正常，但买的东西不进物品栏、手上一直是空的 —— "
-    .. "原因是游戏在回合重建背包后没有自动装备初始武器。这个开关每 0.75 秒检查一次并补上装备，"
-    .. "equip() 本身会发包，服务端是接受的（回 WeaponEquipResolved）。" })
-wl:Label({ Text = string.format("当前状态：自动装备成功次数 = %s   最近一次 = %s",
-    tostring(S.autoEquipCount or 0), tostring(S.autoEquipLast or "无")) })
-
--- ── 自动拾取地上的武器：两个阵营各一套独立配置 ──
--- 切到 T 用 pickupOn_T / pickupStrat_T / pickupRange_T / pickupNamed_T，
--- 切到 CT 用 _CT 那一套；队伍没定时整套不动作。
-S.addPickupSection(wl, "T", "恐怖分子 T")
-S.addPickupSection(wl, "CT", "反恐精英 CT")
-wl:Label({ Text = "两个阵营的配置互不影响：上面「恐怖分子 T」一整段只在你属于 T 时生效，"
-    .. "下面「反恐精英 CT」同理。切换阵营会立刻改用对应那一套。" })
-wl:Label({ Text = "阵营过滤的含义：武器的 Team 字段（Both / Terrorists / Counter-Terrorists）"
-    .. "与自己阵营比对，不符就跳过；策略选「敌人的枪也捡」则关闭这道过滤。" })
-wl:Label({ Text = string.format("当前阵营：%s   已拾取 %s 次   最近一次 = %s",
-    tostring(LP:GetAttribute("Team") or "未分配"),
-    tostring(S.pickupCount or 0), tostring(S.lastPickup or "无")) })
 
 local CLASSES = {
-    { key = "Rifle",   name = "步枪",   desc = "AK-47 / M4 / FAMAS / AUG" },
-    { key = "Sniper",  name = "狙击",   desc = "AWP / SSG 08 / SCAR-20" },
-    { key = "Pistol",  name = "手枪",   desc = "Glock / USP-S / 沙鹰" },
-    { key = "SMG",     name = "冲锋枪", desc = "MP9 / MAC-10 / P90" },
-    { key = "Shotgun", name = "霰弹枪", desc = "Nova / XM1014 / MAG-7" },
-    { key = "Melee",   name = "近战",   desc = "各类刀" },
+    { key = "Rifle",   name = "步枪",   desc = "AK-47 / M4 / FAMAS / AUG",
+      names = { "AK-47", "M4A4", "M4A1-S", "Galil AR", "FAMAS", "AUG", "SG 553" } },
+    { key = "Sniper",  name = "狙击",   desc = "AWP / SSG 08 / SCAR-20",
+      names = { "AWP", "SSG 08", "SCAR-20", "G3SG1" } },
+    { key = "Pistol",  name = "手枪",   desc = "Glock / USP-S / 沙鹰",
+      names = { "Glock-18", "USP-S", "P250", "P2000", "Five-SeveN", "Tec-9",
+                "Dual Berettas", "Desert Eagle", "R8 Revolver", "CZ75-Auto" } },
+    { key = "SMG",     name = "冲锋枪", desc = "MP9 / MAC-10 / P90",
+      names = { "MP9", "MAC-10", "P90", "MP7", "MP5-SD", "PP-Bizon", "UMP-45" } },
+    { key = "Shotgun", name = "霰弹枪", desc = "Nova / XM1014 / MAG-7",
+      names = { "Nova", "XM1014", "MAG-7", "Sawed-Off" } },
+    { key = "Melee",   name = "近战",   desc = "各类刀",
+      names = { "T Knife", "CT Knife", "Karambit", "M9 Bayonet", "Butterfly Knife",
+                "Flip Knife", "Gut Knife", "Skeleton Knife", "Stiletto Knife", "LightSaber" } },
 }
 
 for i, c in ipairs(CLASSES) do
@@ -10653,13 +13797,54 @@ for i, c in ipairs(CLASSES) do
         Precision = 0,
         Callback = function(v) prof.maxDist = v end,
     }, "W_" .. c.key .. "_Dist")
+    -- 静默瞄准距离（按类统一改，写进 aimDistByWeapon 的每一把枪）
+    local curAim = cfg.aimDistByWeapon[c.names[1]] or cfg.maxAimDist
+    sec:Slider({
+        Name = c.name .. " 静默瞄准距离",
+        Default = curAim,
+        Minimum = 5,
+        Maximum = 1500,
+        DisplayMethod = "Value",
+        Precision = 0,
+        Callback = function(v)
+            for _, wn in ipairs(c.names) do
+                cfg.aimDistByWeapon[wn] = v
+            end
+        end,
+    }, "W_" .. c.key .. "_AimDist")
 end
+
+wl:Header({ Text = "自动开火总控" })
+wl:Button({
+    Name = "一键开启全部自动开火（6 类全开）",
+    Callback = function()
+        local opened = {}
+        for k, prof in pairs(cfg.weaponProfiles) do
+            prof.enabled = true
+            opened[#opened + 1] = tostring(k)
+        end
+        table.sort(opened)
+        Window:Notify({
+            Title = "自动开火已全开",
+            Description = "启用: " .. table.concat(opened, " / "),
+            Lifetime = 5,
+        })
+    end,
+}, "AutoFireAll")
+wl:Button({
+    Name = "一键关闭全部自动开火",
+    Callback = function()
+        for k, prof in pairs(cfg.weaponProfiles) do prof.enabled = false end
+        Window:Notify({ Title = "自动开火已全关", Description = "6 类全部关闭", Lifetime = 4 })
+    end,
+}, "AutoFireNone")
+wl:Label({ Text = "「一键开启全部自动开火」只开各类武器的档位开关；总开关仍在战斗页的「启用自动瞄准（总开关）」。静默模式下自动开火会跳过准星偏移检查，穿墙按材质+距离判定，跳过射击间隔由「跳过射击间隔」控制。" })
 
 local curW = wl:Label({ Text = "当前武器: 读取中..." })
 task.spawn(function()
     while true do
         task.wait(0.5)
-        if REG.gen ~= MY_GEN then break end
+        if S._alive == false or REG.gen ~= MY_GEN then break end
         pcall(function()
             local n = heldWeaponName() or "未知"
             local cls = heldWeaponClass()
@@ -10671,8 +13856,8 @@ task.spawn(function()
 end)
 
 -- 杂项
-local ml = T.misc:Section({ Side = "Left" })
-local mr = T.misc:Section({ Side = "Right" })
+local ml = secOf(T.misc, "杂项")
+local mr = secOf(T.misc, "投掷预览与菜单")
 
 mr:Header({ Text = "投掷物抛物线" })
 mr:Toggle({ Name = "拿着投掷物时自动显示", Default = cfg.throwAuto ~= false, Callback = function(v)
@@ -10685,42 +13870,39 @@ mr:Colorpicker({ Name = "抛物线颜色", Default = cfg.throwColor or Color3.fr
     Callback = function(c) cfg.throwColor = c end }, "ThrowColor")
 mr:Label({ Text = "⚠ 预测不等于真实：移动/跳跃时偏差明显（跳跃散射最低 15 度是武器配置里的硬下限）。只当参考线看，别拿它当准星。默认关闭。" })
 
-ml:Header({ Text = "快捷购买" })
 
--- 每把武器的实际买价和阵营（从游戏配置读，不写死）
-local BUY_LIST = { "AK-47", "M4A1-S", "AWP", "M4A4", "Desert Eagle", "Glock-18",
-                   "USP-S", "Kevlar + Helmet" }
-
-local buyStatus = ml:Label({ Text = "读取中..." })
-
-for _, w in ipairs(BUY_LIST) do
-    ml:Button({
-        Name = "购买 " .. w,
-        Callback = function()
-            local ok, msg = buy(w)
-            Window:Notify({
-                Title = ok and "购买" or "买不了",
-                Description = tostring(msg),
-                Lifetime = ok and 2.5 or 4,
-            })
-        end,
-    })
-end
-
-task.spawn(function()
-    while true do
-        task.wait(1)
-        if REG.gen ~= MY_GEN then break end
-        pcall(function()
-            local st = tostring(workspace:GetAttribute("GameState") or "?")
-            local money = tostring(LP:GetAttribute("Money") or "?")
-            local team = myTeam()
-            buyStatus:UpdateName(string.format("阶段=%s  阵营=%s  钱=%s", st, team, money))
-        end)
-    end
-end)
+mr:Header({ Text = "配置" })
+mr:Button({
+    Name = "恢复默认配置（老 UI 那套出厂值）",
+    Callback = function()
+        local ok, msg = S.resetConfig()
+        Window:Notify({ Title = ok and "已恢复默认" or "失败", Description = tostring(msg), Lifetime = 5 })
+    end,
+}, "ResetCfg")
+mr:Label({ Text = "把 cfg 覆盖回加载时的出厂默认值（silentAim / fullSphere / esp / aimPartPriority 等全部回到初始状态）。当前调的这些开关会被重置，慎点。" })
 
 mr:Header({ Text = "菜单控制" })
+-- ⚠ 「关菜单」和「卸载」是两件事，混起来最容易让人以为卸载不干净：
+--   · 快捷键 / 窗口 X  → 只隐藏菜单，透视、FOV 圈、包点标记、自瞄全都还在（这是设计）
+--   · 下面这个按钮     → 真正卸载：断连接、清掉所有 Drawing、还原 hook
+mr:Button({
+    Name = "⏻ 完全卸载（清掉透视 / 圈 / 标记 / hook）",
+    Callback = function()
+        local fc = getgenv().MV_FULL_CLEANUP
+        if type(fc) ~= "function" then
+            Window:Notify({ Title = "卸载", Description = "清理句柄丢失，只能重进服务器", Lifetime = 5 })
+            return
+        end
+        -- 先把还在画的那些东西立刻藏掉，别等 fullCleanup 走到最后一步
+        pcall(function()
+            local S = getgenv().MV_V2 and getgenv().MV_V2.state
+            if not S then return end
+            if S.fovCircleObj then pcall(function() S.fovCircleObj.Visible = false end) end
+        end)
+        pcall(fc)
+    end,
+}, "FullUnload")
+mr:Label({ Text = "关菜单（快捷键 / 右上角 X）只隐藏窗口，透视和圈仍会继续画 —— 那是独立绘制的。想彻底停掉一切，用上面这个按钮，或者跑「卸载脚本.luau」。" })
 mr:Button({
     Name = "重置菜单位置（跑到屏幕外时点这个）",
     Callback = function()
@@ -10765,7 +13947,7 @@ mr:Button({
 task.spawn(function()
     while true do
         task.wait(1)
-        if REG.gen ~= MY_GEN then break end
+        if S._alive == false or REG.gen ~= MY_GEN then break end
         local ok = pcall(function()
             statLabel:UpdateName(string.format("射击 %d 次 | 改写 %d 次 | 注入子弹 %d 颗", S.shots, S.rewritten, S.bulletsInjected))
             local lr = getgenv().MV_THROW_LEARNED
@@ -10785,6 +13967,16 @@ end)
 -- 只清理【本实例】自己的东西：
 -- REG.conns 是跨实例共享的，旧实例绝不能动它，否则会杀掉新实例的连接。
 local function fullCleanup()
+    -- 0) 先让本实例的所有常驻循环失效。
+    -- ⚠ 必须放在第一行、在断开连接和还原 hook 之前：
+    -- 那些 while true 循环每轮都会调 peek / 读属性 / 生成 Drawing，
+    -- 如果等到最后才停，它们会在"hook 已还原、S 已半清空"的状态下再跑几百毫秒，
+    -- 期间任何一次调用都可能抛错，看起来就像"卸载后还有一堆红字"。
+    S._alive = false
+    -- 独立 FOV 圈的停止标志。它那条 while 只看 _fovStop / 对象是否被换掉，
+    -- 以前清理路径从来不置 true —— 对象 Destroy 后只要读属性不抛错就会一直 10Hz 转下去。
+    S._fovStop = true
+
     -- 1) 先把所有功能关掉，否则 hook 还在按旧配置继续工作
     cfg.silentAim = false
     cfg.autoFire = false
@@ -10804,8 +13996,15 @@ local function fullCleanup()
     cfg.showFov = false
     cfg.thirdPerson = false
     pcall(tpUnbind)
-    -- 主绘制循环也要停，否则卸载后还在每帧投影
-    pcall(function() RunService:UnbindFromRenderStep("MV_Draw") end)
+    -- ⚠⚠ RenderStep 是按**名字**全局索引的，新旧实例共用同一串名字。
+    -- 重载时新实例先绑好 "MV_Draw"，旧实例的 fullCleanup 才晚一步执行 ——
+    -- 不加 gen 门的话，旧实例会把**新实例的绑定**一起解绑。
+    -- 症状非常像「功能坏了」：cfg.esp 是 true、日志正常、gen 也对，
+    -- 但 updateEsp 一次都没被调用（espTick 停在 0、S.espObjects 永远是空表），
+    -- 自瞄的 MVHub_Aim 同理 —— 自动开火/平滑瞄准全部停摆。
+    if REG.gen == MY_GEN then
+        pcall(function() RunService:UnbindFromRenderStep("MV_Draw") end)
+    end
 
     -- 2) 删掉所有绘制
     clearEsp()
@@ -10815,6 +14014,10 @@ local function fullCleanup()
     pcall(fovClear)
     pcall(grenadeClear)
     pcall(vfxZoneClear)
+    -- ⚠ 包点标签（A pt / B pt）以前漏在这里。
+    -- 它不在 clearEsp 的池里、也不在 radar/throw 那些 Clear 里，
+    -- 于是卸载后两个 Drawing.Text 永久留在屏幕上，跟着视角走。
+    pcall(S.sitesClear)
     for _, key in ipairs({ "bg", "borderT", "borderB", "borderL", "borderR", "me", "fwd" }) do
         local d = radar[key]
         if d and d.Remove then pcall(function() d:Remove() end) end
@@ -10829,18 +14032,21 @@ local function fullCleanup()
         REG.conns = {}
     end
 
-    -- 4) 解绑渲染步骤
-    pcall(function() RunService:UnbindFromRenderStep("MVHub_Aim") end)
-    pcall(function() RunService:UnbindFromRenderStep("MVHub_AimMobile") end)
-    pcall(function() RunService:UnbindFromRenderStep("MV_Spin") end)
-    pcall(function() RunService:UnbindFromRenderStep("MV_ThirdPerson") end)
+    -- 4) 解绑渲染步骤（同样必须加 gen 门，见上面 "MV_Draw" 那段说明）
+    if REG.gen == MY_GEN then
+        pcall(function() RunService:UnbindFromRenderStep("MVHub_Aim") end)
+        pcall(function() RunService:UnbindFromRenderStep("MVHub_AimMobile") end)
+        pcall(function() RunService:UnbindFromRenderStep("MV_Spin") end)
+        pcall(function() RunService:UnbindFromRenderStep("MV_ThirdPerson") end)
+    end
 
-    -- 5) 兜底：清空整个 Drawing 缓存
+    -- 5) 兜底：销毁本脚本登记过的全部 Drawing
     -- 上面那些 xxxClear 只删本实例记得住的对象，reload 时旧实例的
     -- local 引用可能已经丢了（FOV 圈、箭头、抛物线的线会残留在屏幕上）。
-    -- cleardrawcache 一刀切，保证卸载后屏幕干净。
+    -- 登记表是全脚本共享的，所以这里能一并收干净。
+    -- ⚠ 不再用 cleardrawcache()：它会把执行器 Drawing 系统打坏（见文件开头说明）。
     pcall(function()
-        if cleardrawcache then cleardrawcache() end
+        if type(getgenv().MV_REAP_DRAWINGS) == "function" then getgenv().MV_REAP_DRAWINGS() end
     end)
 
     -- 5) 还原 ShootWeapon.Send
@@ -10874,7 +14080,7 @@ local function fullCleanup()
         end
     end
 
-    -- 6) 清空全部 Drawing，防止残留
+    -- 6) 再收一次 Drawing（上一段之后可能有新对象被建出来）
     --
     -- ⚠⚠⚠ 必须和上面的 hook 还原一样加「自己仍是最新实例」闸门。
     --
@@ -10884,14 +14090,13 @@ local function fullCleanup()
     -- 而埋点在涨：throwTicks=111、throwLineCount=78、ringR=12 —— 代码全在跑。
     --
     -- 原因：MacLib 的 Unload 是**异步**的。新实例早已建好整套 Drawing，
-    -- 旧实例的 fullCleanup 才慢一步跑到这一行，一次 `cleardrawcache()`
-    -- 把新实例的对象全清了：对象仍在内存里、Visible 仍是 true，但不渲染。
+    -- 旧实例的 fullCleanup 才慢一步跑到这一行，一次清空就把新实例的对象全收了。
     -- 重载次数越多，被清的次数越多，最终看起来像「Drawing 整个坏了」。
     --
     -- REG.gen 每次加载递增，所以旧实例到这里一定不相等 → 跳过，交还控制权。
     if REG.gen == MY_GEN then
         pcall(function()
-            if cleardrawcache then cleardrawcache() end
+            if type(getgenv().MV_REAP_DRAWINGS) == "function" then getgenv().MV_REAP_DRAWINGS() end
         end)
     end
 
@@ -10901,11 +14106,56 @@ local function fullCleanup()
         mobileGui = nil
     end
 
+    -- 7b) 菜单 ScreenGui 必须显式关掉    --
+    -- ⚠ 这是「脚本关了/卸载了，但商店和背包还是点不动」的经典原因：
+    -- WindUI 的 ScreenGui 在 DisplayOrder = 2147483647，只要 Enabled 还是 true，
+    -- 它就这么盖在所有游戏 UI 之上。Window:SetState(false) 只藏窗口，不改 Enabled。
+    pcall(function()
+        if S.menuScreenGui then S.menuScreenGui.Enabled = false end
+    end)
+    pcall(function()
+        local hh = (gethui and gethui()) or game:GetService("CoreGui")
+        for _, c in ipairs(hh:GetChildren()) do
+            if c:IsA("ScreenGui")
+                and (c.Name == "WindUI" or c.Name == "MV_SkinPanel" or c.Name == "MVHubMobileControls") then
+                c.Enabled = false
+            end
+        end
+    end)
+
     setInfiniteAmmo(false)
     getgenv().MV_V2 = nil
 end
 
--- 可靠的显示/隐藏快捷键：自己监听输入，不依赖 Maclib 的 Keybind
+-- 把 fullCleanup 暴露给文件前面的 Window.Unload（那里是 local 作用域之外）。
+-- 不注册也能工作（S._alive 已停循环），注册了才能连连接、还原 hook 一起做掉。
+getgenv().MV_FULL_CLEANUP = fullCleanup
+
+-- ═══ 轻量清理（Window:Unload 走这条）═══
+--
+-- 为什么单独做一个：Window:Unload 那一瞬间 WindUI 正在销毁上万个实例，
+-- 如果同一个 tick 里再跑 fullCleanup（断连接 + 清 Drawing + 还原四类 hook），
+-- 压力全挤在一帧 —— 之前就怀疑过这是客户端直接消失的可疑点之一。
+-- 这里只做「纯本地、碰不到游戏状态」的部分：断连接、解绑 RenderStep、清 Drawing。
+-- hook 还原交给 1 秒后的 fullCleanup（由备用存活检测触发）或卸载脚本。
+S.softCleanup = function()
+    for _, c in ipairs(S.conns or {}) do pcall(function() c:Disconnect() end) end
+    S.conns = {}
+    pcall(function() RunService:UnbindFromRenderStep("MV_Draw") end)
+    pcall(function() RunService:UnbindFromRenderStep("MVHub_Aim") end)
+    pcall(function() RunService:UnbindFromRenderStep("MVHub_AimMobile") end)
+    pcall(function() RunService:UnbindFromRenderStep("MV_Spin") end)
+    pcall(function() RunService:UnbindFromRenderStep("MV_ThirdPerson") end)
+    -- 包点标签不在 MV_DRAW_REG 的兜底范围内时（跨实例残留）只有这里能清掉
+    pcall(S.sitesClear)
+    pcall(function()
+        if type(getgenv().MV_REAP_DRAWINGS) == "function" then getgenv().MV_REAP_DRAWINGS() end
+    end)
+    return true
+end
+getgenv().MV_SOFT_CLEANUP = S.softCleanup
+
+-- ═══ 窗口开关快捷键 ═══
 -- 连接放在函数作用域里，不占主 chunk 的 local 槽位（主 chunk 已贴着 200 上限）
 --
 -- ⚠ 必须同时切 ScreenGui.Enabled，不能只调 Window:SetState。
@@ -10922,29 +14172,14 @@ pcall(function()
             pcall(function() Window:SetState(not cur) end)
             -- 关键：同步 ScreenGui.Enabled，才是真正的「让开鼠标」
             pcall(function()
+                -- 统一走 S.findMenuGui：精确名 WindUI（含 Base 的旧库兜底）
                 local sg = S.menuScreenGui
-                if not sg then
-                    local roots = {}
-                    if typeof(gethui) == "function" then
-                        local okh, hh = pcall(gethui)
-                        if okh and hh then roots[#roots + 1] = hh end
-                    end
-                    roots[#roots + 1] = game:GetService("CoreGui")
-                    for _, rt in ipairs(roots) do
-                        local okd, descs = pcall(function() return rt:GetDescendants() end)
-                        if okd and descs then
-                            for _, d in ipairs(descs) do
-                                if d:IsA("ScreenGui") and d:FindFirstChild("Base") then
-                                    S.menuScreenGui = d
-                                    break
-                                end
-                            end
-                        end
-                        if S.menuScreenGui then break end
-                    end
+                if not sg or not sg.Parent then
+                    sg = S.findMenuGui()
+                    S.menuScreenGui = sg
                 end
-                if S.menuScreenGui then
-                    S.menuScreenGui.Enabled = not cur
+                if sg then
+                    sg.Enabled = not cur
                     S.menuVisible = not cur
                 end
             end)
@@ -11055,28 +14290,67 @@ if IS_MOBILE then
     end)
 end
 
-Window.onUnloaded(function()
-    pcall(fullCleanup)
+-- WindUI 没有 onUnloaded（MacLib 专有），清理走 Window:Unload 那条链
+pcall(function()
+    if type(Window.onUnloaded) == "function" then
+        Window.onUnloaded(function() pcall(fullCleanup) end)
+    end
 end)
 
--- 旧实例只退场，绝不做清理：新实例在加载时已经统一清理过了，
--- 如果旧实例也去清，就会把新实例的连接和绘制一起干掉。
+-- 备用存活检测：用户可能直接调 Window:Unload() / WindUI:Destroy() 绕过 fullCleanup。
+--
+-- ⚠ 判据不能只看「GetState 报不报错」：修好 GetState 之后它永远不报错（只返回布尔），
+-- 这条检测就完全失效了，常驻循环会一直跑到下次重载 —— 拿着已销毁的 GUI 对象干活。
+-- 正确判据是「菜单 ScreenGui 真的被销毁」（Destroy 之后 Parent 变成 nil），
+-- 这样和「用户按快捷键把窗口藏起来（Enabled=false，Parent 还在）」能区分开。
 task.spawn(function()
+    local goneStreak = 0
     while true do
         task.wait(0.5)
         if REG.gen ~= MY_GEN then break end
+        -- 已经进入卸载状态（Window:Unload 置的 _alive=false）：
+        -- 等 1 秒让 WindUI 销毁的尖峰过去，再跑完整清理（断连接 / 清 Drawing / 还原 hook）。
+        -- 重载时 gen 会变，这里就 break，不碰新实例。
+        if S._alive == false then
+            task.wait(1)
+            if REG.gen == MY_GEN then pcall(fullCleanup) end
+            break
+        end
         local okWin = pcall(function() return Window:GetState() end)
-        if not okWin then
+        -- 取当前 GUI；失效就重找，但**不要**把找不到写成 nil 之外的判断依据
+        local prev = S.menuScreenGui
+        local sg = prev
+        local prevValid = false
+        if prev then
+            local okP0, p0 = pcall(function() return prev.Parent end)
+            prevValid = (okP0 and p0 ~= nil)
+        end
+        if not prevValid then
+            local found = S.findMenuGui()
+            if found then S.menuScreenGui = found end
+            sg = found
+        end
+        local guiGone = false
+        if sg then
+            local okP, parent = pcall(function() return sg.Parent end)
+            guiGone = (not okP) or (parent == nil)
+        elseif prevValid == false and prev ~= nil then
+            -- 以前拿到过 GUI，现在失效且全树都找不到 → 真的被销毁了
+            guiGone = true
+        end
+        if (not okWin) or guiGone then
+            goneStreak += 1
+        else
+            goneStreak = 0
+        end
+        -- 连续 3 次（1.5 秒）才算真卸载：避免 GUI 重建的瞬间把脚本误判成"已死"而自己卸掉
+        if goneStreak >= 3 then
             pcall(fullCleanup)
             break
         end
     end
 end)
 
-MacLib:SetFolder("MVHubV2")
-T.combat:InsertConfigSection("Right")
-T.combat:Select()
-MacLib:LoadAutoLoadConfig()
 
 -- 注：窗口位置自愈不在这里做。
 -- 菜单的 ScreenGui 挂在执行器的 gethui() / CoreGui 下（不是 PlayerGui），
@@ -11107,6 +14381,938 @@ do
     end)()
 end
 
+-- ⚠ 这里曾经是 paintCurrentModel v2（名字→ColorMap 索引正确，但仍然走
+-- Instance.new("SurfaceAppearance") 这条已被证伪的路：新建的 SA 写进去读回还是旧值）。
+-- 已整段删除，只保留文件尾部那个「只写现有 SA、绝不新建」的最终实现 ——
+-- 重复定义最大的代价是：改了半天以为生效，实际被后面的定义覆盖了。
+
+-- ═══ 瞄准模式 ↔ 配置分组（选哪个模式只显示哪个模式的配置）═══
+S.AIM_MODE_UI = {
+  silent = { "FullSphere", "AimHitPart", "AimPartPrio", "HeadChance", "HeadPrio",
+             "AimSmoke", "MarkSmoke", "AimVisible", "Wallbang", "WallbangOff",
+             "AimDist", "AimTrigger", "AimKeyBtn" },   -- Fov/ShowFov/FovColor 已移出：所有模式共用
+  smooth = { "Smoothness", "Jitter", "SmoothJitter", "ReactDelay", "Overshoot",
+             "SmoothSpeed", "SmoothMaxDeg", "SmoothDrop", "SmoothDead", "SmoothHijack", "NativeAA" },
+  mouse  = { "MouseGain", "MouseStep", "MouseSmooth", "MouseRelease",
+             "MouseTip1", "MouseTip2", "MouseTip3" },
+}
+
+S.applyAimModeUI = function()
+  -- ⚠ FOV 圈是所有自瞄模式共用的，不该跟着模式隐藏。
+  -- 原来 Fov/ShowFov/FovColor 只在 silent 分组里，选「平滑」或「鼠标」就整组消失，
+  -- 表现就是「范围圈没法改、也没法开关」。
+  local ALWAYS_ON = { Fov = true, ShowFov = true, FovColor = true }
+  for k in pairs(ALWAYS_ON) do
+    local w = S.UI[k]
+    if w and w.ElementFrame then pcall(function() w.ElementFrame.Visible = true end) end
+  end
+  local mode = tostring(cfg.aimMode or "smooth")
+  local shown, hidden = 0, 0
+  for m, list in pairs(S.AIM_MODE_UI) do
+    for _, k in ipairs(list) do
+      local w = S.UI[k]
+      if w and w.ElementFrame then
+        local vis = (m == mode)
+        local ok = pcall(function() w.ElementFrame.Visible = vis end)
+        if ok then
+          if vis then shown = shown + 1 else hidden = hidden + 1 end
+        end
+      end
+    end
+  end
+  S.aimUIInfo = string.format("模式=%s 显示%d 隐藏%d", mode, shown, hidden)
+  return S.aimUIInfo
+end
+
+task.spawn(function()
+  local last
+  while true do
+    task.wait(0.5)
+    -- ⚠ 判据必须在 pcall **外面**：写在里面的话 `return` 只结束那个匿名函数，
+    -- 外层 while 照转 —— 卸载后旧实例会继续每 0.5 秒空转一次，永远不停。
+    if S._alive == false or (REG and REG.gen ~= MY_GEN) then break end
+    pcall(function()
+      local m = tostring(cfg.aimMode or "smooth")
+      if m ~= last then
+        last = m
+        S.applyAimModeUI()
+      end
+    end)
+  end
+end)
+
+-- ═══════════════════════════════════════════════════════════════
+-- 换肤最终实现（已实测生效）
+--
+-- 关键发现：
+--   1) 直接改已有 SurfaceAppearance 的 ColorMap → 引擎不重绘（画面不变）
+--   2) 销毁旧 SA + 新建 SA 并写入属性 → **立即重绘**
+--   3) 只写 ColorMap 会丢法线/粗糙度/金属度 → 渲染成死白
+--      （用户实测截图：枪变纯白，就是这一步）
+-- 所以正确做法：完整复制源 SA 的全部贴图属性到新建的 SA
+-- ═══════════════════════════════════════════════════════════════
+-- ⚠ 必须包含 TexturePackContent。
+-- 引擎优先用 SurfaceAppearance 的**烘焙纹理包**渲染，ColorMap 只在没有烘焙包时生效。
+-- 实测：把 ColorMap 写成 Luminex 的值、TexturePackContent 还是原皮的 → 读回值是新的，
+-- 画面一点不变。把烘焙包也一起抄过来才真正换色。
+-- MaterialMode 在旧版 SA 上会报 "not a valid member"，所以不放进来（pcall 吞错但不干净）。
+S.SA_PROPS = { "ColorMap", "NormalMap", "RoughnessMap", "MetalnessMap", "EmissiveMaskContent", "AlphaMode", "TexturePackContent" }
+
+-- ⚠⚠ 读/写 SurfaceAppearance 必须切到 thread identity 7。
+--
+-- 实测（Real 执行器，本 place）：
+--   identity 8（默认）：sa.ColorMap 读取 → "The current thread cannot read 'ColorMap'
+--                        (lacking capability Plugin)"，写入同样被拒。
+--   identity 7：读得到 rbxassetid://…，写后能读回新值。
+-- 之前所有 SA 读写都在 8 下，全部被静默拒绝 —— 表现就是
+-- 「srcMap 永远是空表 → painted=0 → 皮肤一点不变，但 UI 显示已选」。
+-- gethiddenproperty 在 8 下也不管用，同样需要 7。
+S.saGet = function(sa, k)
+    if not sa then return nil end
+    local can = (type(setthreadidentity) == "function")
+    local outermost = (S._saDepth or 0) == 0
+    if outermost and can then pcall(setthreadidentity, 7) end
+    local ok, v = pcall(function() return sa[k] end)
+    if (not ok or v == nil) and type(gethiddenproperty) == "function" then
+        local ok2, v2 = pcall(gethiddenproperty, sa, k)
+        if ok2 and v2 ~= nil then ok, v = true, v2 end
+    end
+    if outermost and can then pcall(setthreadidentity, 8) end
+    if ok then return v end
+    return nil
+end
+
+-- ⚠ identity 切换本身有开销。一次换肤要读 8 部件 × 7 属性 × 2 次切换 = 一百多次，
+-- 手持时点击回调直接卡死（用户看到的就是「拿着枪点美化没反应，换把枪就能点」）。
+-- 用嵌套计数把它压成「整段操作只切 2 次」。
+S._saDepth = 0
+S.saEnter = function()
+    S._saDepth = (S._saDepth or 0) + 1
+    if S._saDepth == 1 and type(setthreadidentity) == "function" then
+        pcall(setthreadidentity, 7)
+    end
+end
+S.saLeave = function()
+    S._saDepth = math.max(0, (S._saDepth or 0) - 1)
+    if S._saDepth == 0 and type(setthreadidentity) == "function" then
+        pcall(setthreadidentity, 8)
+    end
+end
+
+S.saSet = function(sa, k, v)
+    if not sa then return false end
+    local can = (type(setthreadidentity) == "function")
+    local outermost = (S._saDepth or 0) == 0
+    if outermost and can then pcall(setthreadidentity, 7) end
+    local ok = pcall(function() sa[k] = v end)
+    if not ok and type(sethiddenproperty) == "function" then
+        ok = pcall(sethiddenproperty, sa, k, v)
+    end
+    if outermost and can then pcall(setthreadidentity, 8) end
+    return ok
+end
+
+S.getColorMap = function(sa)
+    if not sa then return nil end
+    return S.saGet(sa, "ColorMap")
+end
+
+S.copySAPart = function(srcSA, dstPart)
+    if not srcSA or not dstPart then return false end
+    local props = {}
+    for _, k in ipairs(S.SA_PROPS) do
+        local v = S.saGet(srcSA, k)
+        if v ~= nil then props[k] = v end
+    end
+    local old = dstPart:FindFirstChildOfClass("SurfaceAppearance")
+    if old then pcall(function() old:Destroy() end) end
+    local okNew, newSA = pcall(function()
+        local x = Instance.new("SurfaceAppearance")
+        x.Name = "SurfaceAppearance"
+        x.Parent = dstPart
+        return x
+    end)
+    if not okNew then return false end
+    local n = 0
+    for k, v in pairs(props) do
+        if pcall(function() newSA[k] = v end) then n = n + 1 end
+    end
+    return true, n
+end
+
+-- ═══ hook Skins.GetCameraModel：让游戏自己构建 viewmodel 时就用我们的皮肤 ═══
+-- 为什么必须 hook：不 hook 的话，游戏每次重建 viewmodel 都按 CurrentEquipped.Skin
+-- 应用它自己的皮肤，而我们在旁边不停改材质 → 两边对抗 → 皮肤闪烁。
+-- hook 之后游戏直接拿到我们指定的皮肤模型，从根本上不存在对抗。
+S.skinOrigGetCameraModel = nil
+S.installSkinHook = function()
+    -- ⚠ 必须返回 true，不能返回 nil：调用方写的是 `if not S.installSkinHook() then
+    -- return false, "皮肤库不可用"`，返回 nil 会被当成「安装失败」。
+    if S.skinHookInstalled then return true end
+    local lib = S.getSkinsLib()
+    if not lib or type(lib.GetCameraModel) ~= "function" then return false end
+
+    -- 幂等：重载时 lib.GetCameraModel 上已经是上一实例的 wrapper，
+    -- 通过 MV_ORIG_OF 取真正的原版，绝不在 wrapper 外面再套一层。
+    local cur = lib.GetCameraModel
+    local origOfS = getgenv().MV_ORIG_OF
+    local orig = (origOfS and origOfS(cur)) or cur
+
+    local function wrapper(weapon, skin, a3, a4, a5, a6, a7, a8)
+        local wn = tostring(weapon)
+        -- 计数 + 最近一次调用记录：排查「换刀/换肤没生效」时先看这里
+        --   skinHookCalls 一直不涨 = 游戏根本没重建 viewmodel（切枪/重生才会）
+        S.skinHookCalls = (S.skinHookCalls or 0) + 1
+        S.skinHookLast = wn
+        -- ★ 换刀：把「建模型用的武器名」换掉（纯本地视觉，服务端零感知）。
+        --   游戏挂载时会用**当前武器名**给模型命名，所以查 viewmodel 的逻辑不受影响。
+        local modelWeapon = (S.modelWeaponOf and S.modelWeaponOf(wn)) or wn
+        local swapped = (modelWeapon ~= wn)
+        -- 换刀后皮肤必须取**目标武器自己**的皮肤表：
+        -- T Knife 只有 Stock，蝴蝶刀的皮肤（Fade/Damascus/Blackwidow…）挂在它自己名下。
+        local want
+        if swapped then
+            want = S.skinPaint and S.skinPaint[modelWeapon]
+        else
+            want = S.skinPaint and S.skinPaint[wn]
+        end
+        -- ⚠ 以前排除了 "Stock"：手动选原版只在当前模型生效，之后 viewmodel 重建时
+        -- hook 不再覆盖，游戏会用你自己拥有的皮肤 → 看起来像「选原版没生效」。
+        -- 现在显式写 "Stock" 也照样覆盖，保证原版选择在重建后依然成立。
+        if want and want ~= "" then skin = want end
+        -- ⚠ 必须把原函数的返回值原样交回游戏。
+        -- 少这一句 → 游戏拿到的永远是 nil → viewmodel 建不出来，
+        -- 表现就是「手上模型消失 / 武器模型重建异常 / 快捷栏脱节」。
+        local model = orig(modelWeapon, skin, a3, a4, a5, a6, a7, a8)
+        S.skinHookLastModel = modelWeapon
+        if swapped then S.skinHookSwapHits = (S.skinHookSwapHits or 0) + 1 end
+
+        -- ⚠⚠ 关键：在**交回游戏之前**把 SurfaceAppearance 换成皮肤模板的克隆。
+        --
+        -- 为什么必须在这里做，而不是事后改 viewmodel：
+        --   · ColorMap / TexturePackContent 事后都能写进去、也能读回新值，
+        --     但引擎对我们改过的 SA **不重绘**（实测：改完 1 秒读回值仍是新的，画面一点不变）
+        --   · TexturePackContent 还是只读的（写入 pcall 返回 false），而它优先级高于 ColorMap
+        -- 换一个**全新的 SA 实例**（从 Assets.Skins 的模板 Clone）才可能让引擎重建材质。
+        -- 而在模型刚构建、还没挂到场景里的时候替换，重建是必然发生的。
+        if model and typeof(model) == "Instance" and want and want ~= "" then
+            pcall(function()
+                local root = S.getSkinsRoot()
+                -- ⚠ 必须用 modelWeapon：换刀后材质在目标刀自己的目录下
+                local wf = root and root:FindFirstChild(modelWeapon)
+                local sf = wf and wf:FindFirstChild(tostring(want))
+                if not sf then return end
+                local camF = sf:FindFirstChild("Camera") or sf
+                local wearF = camF:FindFirstChild(tostring(S.skinWear or ""))
+                if not wearF then
+                    for _, c in ipairs(camF:GetChildren()) do
+                        if c:IsA("Folder") then wearF = c break end
+                    end
+                end
+                if not wearF then return end
+                if S.saEnter then S.saEnter() end
+                local n = 0
+                for _, d in ipairs(model:GetDescendants()) do
+                    if d:IsA("MeshPart") then
+                        -- ★ 跳过手臂 / 手套 / 锚点：S.SKIN_SKIP 在 5641 行定义，
+                        --   paintCurrentModel 一直遵守它，这条 hook 路径以前漏了。
+                        --   后果：手部被套上武器皮肤材质 → 用户看到「手背贴膜 / 手不见了」。
+                        if not (S.SKIN_SKIP and S.SKIN_SKIP[d.Name]) then
+                            local src = wearF:FindFirstChild(d.Name)
+                            if src and src:IsA("SurfaceAppearance") then
+                                -- ★★ 顺序必须是「先 Clone、成功再销毁旧的」。
+                                --   原来是先 Destroy 再 Clone：Clone 一旦失败
+                                --   （模板 SA 带 TexturePackContent / 受保护 / 已销毁），
+                                --   这个 MeshPart 就变成**没有 SurfaceAppearance 的裸模型** ——
+                                --   画面上的表现就是「武器/手部模型消失」。
+                                local okC, cloned = pcall(function() return src:Clone() end)
+                                if okC and cloned then
+                                    local old = d:FindFirstChildOfClass("SurfaceAppearance")
+                                    if old then pcall(function() old:Destroy() end) end
+                                    cloned.Parent = d
+                                    n = n + 1
+                                else
+                                    S.skinHookCloneFail = (S.skinHookCloneFail or 0) + 1
+                                end
+                            end
+                        end
+                    end
+                end
+                if S.saLeave then S.saLeave() end
+                S.skinHookSwapped = n
+                S.skinHookWeapon = tostring(weapon) .. "→" .. tostring(want) .. "@" .. tostring(wearF and wearF.Name)
+            end)
+        end
+        return model
+    end
+    getgenv().MV_MARK_WRAP(wrapper, orig)
+
+    lib.GetCameraModel = wrapper
+    S.skinOrigGetCameraModel = orig
+    S.skinHookInstalled = true
+    return true
+end
+
+-- ═══ 皮肤材质的**真正**来源 ═══
+--
+-- 实测：lib.GetCameraModel(weapon, skin) 对 Stock 和 Luminex 返回**完全相同**的 ColorMap
+-- （逐部件对比一模一样）—— 它给的是原皮模板，真正的皮肤材质不在这里。
+--
+-- HasSkinTextures 的实现暴露了真实结构：
+--     v1 = Skins:FindFirstChild(a1)          -- Upvalue "Skins"
+--     v2 = v1:FindFirstChild(a2)
+--     return v2:IsA("Folder")
+-- 顺着 HasSkinTextures 的第 1 个 upvalue 取到实例：ReplicatedStorage.Assets.Skins
+--
+--   ReplicatedStorage.Assets.Skins/
+--     AK-47/
+--       Luminex/
+--         Camera/                    ← 第一人称 viewmodel 用的那一套
+--           Factory New/             ← 磨损等级
+--             Barrel  [SurfaceAppearance]   ← 部件名 → 直接就是该部件的 SA
+--             Mag     [SurfaceAppearance]
+--             Bolt / other / Handle / body …
+--           Field-Tested/ Battle-Scarred/ Minimal Wear/ Well-Worn/
+--       Stock/ …
+--
+-- 所以正确做法是：按部件名把这些 SA 的属性抄到 viewmodel 对应部件的 SA 上。
+S.getSkinsRoot = function()
+    local cached = S._skinsRoot
+    if cached and cached.Parent then return cached end
+    local rs = game:GetService("ReplicatedStorage")
+    local assets = rs:FindFirstChild("Assets")
+    local root = assets and assets:FindFirstChild("Skins")
+    if not root then
+        -- 兜底：走 HasSkinTextures 的 upvalue
+        local lib = S.getSkinsLib()
+        if lib and type(lib.HasSkinTextures) == "function" and type(debug.getupvalue) == "function" then
+            local ok, v = pcall(debug.getupvalue, lib.HasSkinTextures, 1)
+            if ok and typeof(v) == "Instance" then root = v end
+        end
+    end
+    S._skinsRoot = root
+    return root
+end
+
+S.getSkinSAMap = function(weaponName, skinName, wearName)
+    local root = S.getSkinsRoot()
+    if not root then return nil, "no-skins-root" end
+    local wf = root:FindFirstChild(tostring(weaponName))
+    if not wf then return nil, "no-weapon-folder" end
+    local sf = wf:FindFirstChild(tostring(skinName))
+    if not sf then return nil, "no-skin-folder" end
+    local camF = sf:FindFirstChild("Camera")
+    if not camF then
+        -- 有些皮肤可能没有 Camera 分层，直接用自身
+        camF = sf
+    end
+    local wearF = camF:FindFirstChild(tostring(wearName or ""))
+    if not wearF then
+        -- ⚠ 默认必须用 Factory New，和皮肤图鉴的预览图一致。
+        -- 以前取的是 GetChildren 的**第一个**，而多数皮肤的文件夹顺序是
+        -- Battle-Scarred 打头 → 刷上去是重度磨损版，和预览差很远，
+        -- 看起来就像"这几个皮肤换不了"。实测 11 个 AK 皮肤里，
+        -- 只有 Sakura/Aniki/Midas/Red Baron/Luminex/Rebellion/Lore/Sovapid 是 5 档齐全且首项为 Battle-Scarred。
+        wearF = camF:FindFirstChild("Factory New")
+        if not wearF then
+            for _, c in ipairs(camF:GetChildren()) do
+                if c:IsA("Folder") then wearF = c break end
+            end
+        end
+    end
+    if not wearF then return nil, "no-wear-folder" end
+    local map = {}
+    if S.saEnter then S.saEnter() end
+    for _, sa in ipairs(wearF:GetChildren()) do
+        if sa:IsA("SurfaceAppearance") then
+            local t = {}
+            for _, k in ipairs(S.SA_PROPS or { "ColorMap", "NormalMap", "RoughnessMap", "MetalnessMap" }) do
+                t[k] = S.saGet(sa, k)
+            end
+            if t.ColorMap then map[sa.Name] = t end
+        end
+    end
+    if S.saLeave then S.saLeave() end
+    S.skinWearUsed = wearF.Name
+    return map
+end
+
+S.paintCurrentModel = function(weaponName, skinName)
+    local lib = S.getSkinsLib()
+    if not lib then return 0 end
+    local cam = workspace.CurrentCamera
+    local vm = cam and cam:FindFirstChild(tostring(weaponName))
+    if not vm then return 0 end
+    local weapon = vm:FindFirstChild("Weapon") or vm
+
+    -- ⭐ 首选：直接读 Assets.Skins 里的真实皮肤材质
+    -- （GetCameraModel 对 Stock / Luminex 返回的 ColorMap 完全一样，是原皮模板）
+    local srcMap, why = S.getSkinSAMap((S.modelWeaponOf and S.modelWeaponOf(weaponName)) or weaponName, skinName, S.skinWear)
+    if not srcMap or next(srcMap) == nil then
+        S.lastPaintErr = "Skins 资源缺失: " .. tostring(why)
+        return 0
+    end
+    S._srcMapSize = 0
+    for _ in pairs(srcMap) do S._srcMapSize = S._srcMapSize + 1 end
+
+    -- ⭐ 关键：直接写现有 SA 的属性，绝不销毁/新建。
+    -- 实测（2026-11-05）：
+    --   · 直接 sa.ColorMap = xxx  → 画面立刻变化（黑枪变白、变 Canvas 蓝紫图案，均有截图）
+    --   · 销毁旧 SA + Instance.new → 写不进去（painted=8 但读回还是旧值，画面不变）
+    --   · srcSA:Clone() 挂上去    → 枪直接消失
+    -- 之前所有"渲染不重绘"的结论都是错的：那是把 Aurora（本身就是白色皮肤）当成了失败信号。
+    local n = 0
+    local rejected = 0
+    -- 第二段 identity 7：只包住目标部件的读写
+    if S.saEnter then S.saEnter() end
+    for _, d in ipairs(weapon:GetDescendants()) do
+        if d:IsA("MeshPart") and not S.SKIN_SKIP[d.Name] then
+            local src = srcMap[d.Name]
+            if src then
+                local sa = d:FindFirstChildOfClass("SurfaceAppearance")
+                if sa then
+                    -- ⚠ 判据必须看「写后是否等于目标值」，不能看「是否和原值不同」。
+                    -- 用「不同」的话：重复点同一款皮肤（早就是目标值了）会被判成失败，
+                    -- 而且 ColorMap 相同、只有法线/发光不同的皮肤也永远写不进去。
+                    local target = src.ColorMap
+                    for k, v in pairs(src) do
+                        if v ~= nil then S.saSet(sa, k, v) end
+                    end
+                    local after = S.getColorMap(sa)
+                    if after ~= nil and tostring(after) == tostring(target) then
+                        n = n + 1
+                    else
+                        rejected += 1
+                    end
+                end
+            end
+        end
+    end
+    if S.saLeave then S.saLeave() end
+    S.lastPaintRejected = rejected
+    S._srcMapSize = 0
+    for _ in pairs(srcMap) do S._srcMapSize = S._srcMapSize + 1 end
+    return n
+end
+
+-- ═══ 皮肤图鉴面板（缩略图网格，点图即换，每把枪独立）═══
+-- ═══ 皮肤列表面板（纯文字，按品质从高到低，点一下即换）═══
+-- 为什么不用 WindUI 的按钮：实测 WindUI 的 Button 没有图标槽（SetImage 不创建 ImageLabel），
+-- 而且 btn:SetTitle() 调用成功但实际显示的文本不更新（读回还是旧值），做不了动态列表。
+-- 所以用自建 ScreenGui，完全可控。
+-- ═══ 皮肤图片面板（只显示「指定武器的皮肤」，不再重复列武器）═══
+-- 调用方式：先设 S._pendingWeapon = "AK-47"，再调 S.openSkinPanel()。
+-- 武器选择在主 GUI（美化页）里完成，这里只负责显示该枪的皮肤图。
+-- ═══ 主窗口状态查询：返回 (是否可见, 窗口Frame) ═══
+-- 为什么检查整条链：WindUI 关闭窗口可能是 ScreenGui.Enabled=false，也可能是
+-- Window.Visible=false 或 Frame.Visible=false，只看其中一个会漏，面板就关不掉。
+S.isMainVisible = function()
+    local hh = (gethui and gethui()) or game:GetService("CoreGui")
+    local w = hh:FindFirstChild("WindUI")
+    if not w or not w.Enabled then return false, nil end
+    local win = w:FindFirstChild("Window")
+    if not win then return false, nil end
+    -- ⚠ Window 是 Folder，没有 Visible 属性（访问会直接报错），只检查它下面的 Frame
+    local f = win:FindFirstChild("Frame")
+    if not f or not f:IsA("Frame") or not f.Visible then return false, nil end
+    if f.AbsoluteSize.Y < 100 or f.AbsoluteSize.X < 200 then return false, nil end
+    return true, f
+end
+
+-- 兼容旧调用
+S.getMainWindowFrame = function()
+    local ok, f = S.isMainVisible()
+    return (ok and f) or nil
+end
+
+-- ═══ 皮肤图片面板（窄栏，贴在主菜单左边，可上下滑）═══
+-- 尺寸参照：宽 340、最高 500；皮肤多时在网格里上下滚动。
+-- 位置：优先贴着主窗口左边缘；找不到主窗口就贴在屏幕左侧居中的位置。
+S.openSkinPanel = function()
+    local RS2 = game:GetService("ReplicatedStorage")
+    local lib2 = S.getSkinsLib()
+    if not lib2 then return false, "皮肤库不可用" end
+
+    local wn = tostring(S._pendingWeapon or "")
+    if wn == "" then
+        local ic0 = require(RS2.Controllers.InventoryController)
+        local w0 = ic0.peekCurrentEquippedForMovement()
+        wn = w0 and tostring(w0.Name) or ""
+    end
+    S._pendingWeapon = nil
+    if wn == "" then return false, "没有指定武器" end
+
+    local okL, list = pcall(lib2.GetAllSkinsForWeapon, wn)
+    if not okL or type(list) ~= "table" or #list == 0 then return false, wn .. " 没有皮肤" end
+
+    local ORDER = S.RARITY_ORDER or { Red = 1, Pink = 2, Purple = 3, Blue = 4, Stock = 9 }
+    table.sort(list, function(a, b)
+        local ra = ORDER[tostring(a.rarity)] or 9
+        local rb = ORDER[tostring(b.rarity)] or 9
+        if ra ~= rb then return ra < rb end
+        return tostring(a.skin) < tostring(b.skin)
+    end)
+
+    -- ★★★ 2026-11-06：面板容器从 gethui() 改成 PlayerGui ★★★
+    --
+    -- 实测：Real 的 gethui() 返回的是 `CoreGui.RobloxGui`（一个 ScreenGui），
+    -- 挂在它下面的 ScreenGui **Destroy 会静默失败** —— pcall 返回 true、对象还在。
+    -- 后果：每次 openSkinPanel 都建一个新面板、旧的永远删不掉，
+    -- 一口气攒了 22 个 `MV_SkinPanel`（全 Enabled=false 堆在 CoreGui 里），
+    -- 下面这段"先清同名面板"的循环其实一次都没生效。
+    --
+    -- PlayerGui 可以正常 Destroy；ResetOnSpawn=false 保证重生不会被清掉。
+    local lpG = game:GetService("Players").LocalPlayer
+    local holder = (lpG and lpG:FindFirstChild("PlayerGui"))
+        or ((gethui and gethui()) or game:GetService("CoreGui"))
+    -- ⚠ 必须清掉「所有」同名面板，不能只删找到的第一个：
+    -- FindFirstChild 只返回一个，快速连点两个武器时会各建一个面板，屏幕上就并排出现两个。
+    -- 句柄 + 全量遍历双保险。
+    --
+    -- ★★★ 2026-11-06 实测修正：Real 里 ScreenGui:Destroy() **是空操作** ★★★
+    --   实测（两种容器都试过）：
+    --       sg:Destroy()  → pcall 返回 true，但 sg.Parent 仍然不是 nil，对象还在
+    --   所以原来这里的 Destroy 一次都没真正生效，22 个 MV_SkinPanel 就是这么攒出来的。
+    --   正确做法是「停用 + 从父级摘掉」：Enabled=false 不渲染，Parent=nil 脱离整棵树。
+    if S._skinPanelGui then
+        pcall(function()
+            S._skinPanelGui.Enabled = false
+            S._skinPanelGui.Parent = nil
+        end)
+        S._skinPanelGui = nil
+    end
+    for _, d in ipairs(holder:GetChildren()) do
+        if d:IsA("ScreenGui") and d.Name == "MV_SkinPanel" then
+            pcall(function()
+                d.Enabled = false
+                d.Parent = nil
+            end)
+        end
+    end
+
+    -- 手机端适配：屏幕窄 → 卡片更小、面板居中；PC → 贴主窗口左边
+    local UIS2 = game:GetService("UserInputService")
+    local IS_M = UIS2.TouchEnabled and not UIS2.KeyboardEnabled
+    local COLS = 2
+    local CELL_W, CELL_H, PAD = IS_M and 128 or 156, IS_M and 96 or 118, 6
+    local W = COLS * CELL_W + PAD * 2 + 8
+    local rows = math.ceil(#list / COLS)
+    local H = math.min(rows * (CELL_H + PAD) + 44, IS_M and 400 or 500)
+
+    local vp2 = workspace.CurrentCamera and workspace.CurrentCamera.ViewportSize or Vector2.new(1920, 1080)
+    local px, py = 24, 120
+    if IS_M then
+        px = math.max(4, (vp2.X - W) / 2)
+        py = math.max(4, (vp2.Y - H) / 2)
+    else
+        -- ⚠ 主窗口真实路径是 WindUI → Window → Frame（不是 ScreenGui 直接子级叫 Main 的东西）
+        -- 之前按 "Main" 找永远是 nil，所以面板一直退到默认的 24,62 —— 这就是"不跟随"的根因
+        local mf = S.getMainWindowFrame and S.getMainWindowFrame()
+        if mf then
+            local mp, ms = mf.AbsolutePosition, mf.AbsoluteSize
+            -- ms.Y 要一起检查：窗口展开动画期间 AbsoluteSize.Y 会是 0，此时读到的 Y 是动画中间值
+            if ms.X > 200 and ms.Y > 100 then
+                px = mp.X - W - 12
+                if px < 8 then px = mp.X + ms.X + 12 end   -- 左边放不下就贴右边
+                py = mp.Y
+            end
+        end
+    end
+
+    local sg = Instance.new("ScreenGui")
+    sg.Name = "MV_SkinPanel"
+    sg.ResetOnSpawn = false
+    sg.IgnoreGuiInset = true
+    sg.DisplayOrder = 2147483647   -- 必须最高，否则被游戏主菜单盖住（实测 998 时完全看不见）
+    -- ★★★ 2026-11-06 修复「点了美化选项什么也不出现」 ★★★
+    -- 下面那段跟随循环只在 S.isMainVisible() 为真时才 sg.Enabled = true，
+    -- 也就是说主窗口关着的时候，面板建出来了却一直是 Enabled=false —— 屏幕上什么都没有。
+    -- 用户是在游戏里（主窗口收着）点武器想开图鉴，所以永远看不到面板。
+    -- 面板是独立弹窗，创建即显示；跟随循环只负责把它贴在主窗口旁边。
+    sg.Enabled = true
+    sg.Parent = holder
+    S._skinPanelGui = sg
+
+    local frame = Instance.new("Frame")
+    frame.Size = UDim2.fromOffset(W, H)
+    frame.Position = UDim2.fromOffset(px, py)
+    frame.BackgroundColor3 = Color3.fromRGB(16, 18, 24)
+    frame.BorderSizePixel = 0
+    frame.Parent = sg
+    local cc = Instance.new("UICorner")
+    cc.CornerRadius = UDim.new(0, 8)
+    cc.Parent = frame
+    -- ⚠ 跟随 + 精准对齐 + 随主菜单显隐
+    --   · 显隐：用 S.isMainVisible() 检查整条链（ScreenGui.Enabled / Window.Visible / Frame.Visible / 尺寸）
+    --   · 对齐：不直接写绝对坐标，而是算「目标位置 - 当前 AbsolutePosition」的差值再补，
+    --     这样 IgnoreGuiInset 带来的坐标系差（实测偏 58px）会被自动吃掉。
+    if not IS_M then
+        task.spawn(function()
+            local W2 = W
+            while frame.Parent do
+                local okv, vis, mfv = pcall(function()
+                    return S.isMainVisible()
+                end)
+                if okv and vis then
+                    if not sg.Enabled then sg.Enabled = true end
+                    local mp2 = mfv.AbsolutePosition
+                    local ms2 = mfv.AbsoluteSize
+                    local nx = mp2.X - W2 - 12
+                    if nx < 8 then nx = mp2.X + ms2.X + 12 end
+                    local cp = frame.AbsolutePosition
+                    local dx = nx - cp.X
+                    local dy = mp2.Y - cp.Y
+                    if math.abs(dx) > 0.5 or math.abs(dy) > 0.5 then
+                        local cpos = frame.Position
+                        frame.Position = UDim2.fromOffset(cpos.X.Offset + dx, cpos.Y.Offset + dy)
+                    end
+                end
+                -- ★★★ 2026-11-06：这里原来还有一段
+                --     else
+                --         if sg.Enabled then sg.Enabled = false end
+                --     end
+                -- 意思是「主窗口收起来就把图鉴面板一起关掉」。
+                -- 但用户是在游戏里点武器开图鉴的 —— 主窗口本来就收着，
+                -- 于是面板每一帧被强制 Enabled=false，屏幕上一个像素都看不到。
+                -- 图鉴是独立弹窗，显隐只由它自己的 × 按钮控制，不再跟主窗口联动。
+                task.wait(0.08)
+            end
+        end)
+    end
+
+
+    local title = Instance.new("TextLabel")
+    title.Size = UDim2.new(1, -56, 0, 26)
+    title.Position = UDim2.fromOffset(8, 3)
+    title.BackgroundTransparency = 1
+    title.Font = Enum.Font.GothamBold
+    title.TextSize = 13
+    title.TextColor3 = Color3.fromRGB(235, 240, 250)
+    title.TextXAlignment = Enum.TextXAlignment.Left
+    title.TextTruncate = Enum.TextTruncate.AtEnd
+    title.Text = string.format("%s · %d 款", wn, #list)
+    title.Parent = frame
+
+    local close = Instance.new("TextButton")
+    close.Size = UDim2.fromOffset(24, 24)
+    close.Position = UDim2.new(1, -30, 0, 3)
+    close.BackgroundColor3 = Color3.fromRGB(120, 40, 45)
+    close.BorderSizePixel = 0
+    close.Font = Enum.Font.GothamBold
+    close.TextSize = 14
+    close.TextColor3 = Color3.fromRGB(255, 235, 235)
+    close.Text = "×"
+    close.Parent = frame
+    close.MouseButton1Click:Connect(function() sg:Destroy() end)
+
+    local grid = Instance.new("ScrollingFrame")
+    grid.Size = UDim2.new(1, -8, 1, -32)
+    grid.Position = UDim2.fromOffset(4, 30)
+    grid.BackgroundTransparency = 1
+    grid.BorderSizePixel = 0
+    grid.ScrollBarThickness = 4
+    grid.CanvasSize = UDim2.new(0, 0, 0, 0)
+    grid.AutomaticCanvasSize = Enum.AutomaticSize.Y
+    grid.ScrollingDirection = Enum.ScrollingDirection.Y
+    grid.Parent = frame
+    local glay = Instance.new("UIGridLayout")
+    glay.CellSize = UDim2.fromOffset(CELL_W, CELL_H)
+    glay.CellPadding = UDim2.fromOffset(PAD, PAD)
+    glay.Parent = grid
+
+    local RAR = {
+        Red = Color3.fromRGB(235, 75, 75), Pink = Color3.fromRGB(235, 105, 180),
+        Purple = Color3.fromRGB(165, 105, 235), Blue = Color3.fromRGB(90, 165, 245),
+        Stock = Color3.fromRGB(190, 195, 205),
+    }
+    local RAR_CN = { Red = "红", Pink = "粉", Purple = "紫", Blue = "蓝", Stock = "原版" }
+    local cur = tostring(S.skinPaint[wn] or "")
+
+    for _, item in ipairs(list) do
+        local skin = tostring(item.skin)
+        local rar = tostring(item.rarity or "?")
+        local card = Instance.new("TextButton")
+        card.BackgroundColor3 = (skin == cur) and Color3.fromRGB(35, 62, 45) or Color3.fromRGB(26, 30, 38)
+        card.BorderSizePixel = 0
+        card.Text = ""
+        card.Parent = grid
+        local bc = Instance.new("UICorner")
+        bc.CornerRadius = UDim.new(0, 6)
+        bc.Parent = card
+        local img = Instance.new("ImageLabel")
+        img.Size = UDim2.new(1, -6, 0, IS_M and 58 or 74)
+        img.Position = UDim2.fromOffset(3, 3)
+        img.BackgroundColor3 = Color3.fromRGB(20, 22, 28)
+        img.BorderSizePixel = 0
+        img.ScaleType = Enum.ScaleType.Fit
+        local tex
+        pcall(function() tex = lib2.GetWearImageForFloat(item, 0.01) end)
+        if type(tex) == "string" then img.Image = tex end
+        img.Parent = card
+        local nl = Instance.new("TextLabel")
+        nl.Size = UDim2.new(1, -6, 0, 14)
+        nl.Position = UDim2.fromOffset(3, IS_M and 62 or 80)
+        nl.BackgroundTransparency = 1
+        nl.Font = Enum.Font.GothamBold
+        nl.TextSize = 10
+        nl.TextXAlignment = Enum.TextXAlignment.Left
+        nl.TextTruncate = Enum.TextTruncate.AtEnd
+        nl.TextColor3 = RAR[rar] or Color3.fromRGB(210, 215, 225)
+        nl.Text = (S.skinCN and S.skinCN(skin)) or skin
+        nl.Parent = card
+        local rl = Instance.new("TextLabel")
+        rl.Size = UDim2.new(1, -6, 0, 12)
+        rl.Position = UDim2.fromOffset(3, IS_M and 77 or 96)
+        rl.BackgroundTransparency = 1
+        rl.Font = Enum.Font.Gotham
+        rl.TextSize = 8
+        rl.TextXAlignment = Enum.TextXAlignment.Left
+        rl.TextColor3 = RAR[rar] or Color3.fromRGB(140, 148, 162)
+        rl.Text = string.format("%s %s", RAR_CN[rar] or rar, skin)
+        rl.Parent = card
+        card.MouseButton1Click:Connect(function()
+            S.setSkin(wn, skin)
+            local n = S.paintCurrentModel(wn, skin)
+            S.lastSkinPaint = string.format("%s -> %s (%s)", wn, skin, tostring(n))
+            for _, ch in ipairs(grid:GetChildren()) do
+                if ch:IsA("TextButton") then ch.BackgroundColor3 = Color3.fromRGB(26, 30, 38) end
+            end
+            -- ⚠ 不能无条件标成「已选」。
+            -- 以前不管 n 是几都涂绿：玩家看到卡片选中了、枪一点没变 ——
+            -- 因为「匹配到 0 个部件」和「成功」在 UI 上是同一个样子。
+            -- 手持状态下 0 部件 = 真失败（结构不支持），标红并留一条原因。
+            -- ⚠ 别用 cam:FindFirstChild(wn) 判手持 —— 游戏会把不用的武器 viewmodel
+            -- 留在 workspace.Camera 里，于是「拿着 Glock 点 AK」也会被当成手持，
+            -- 然后 n=0 被标红。改用 InventoryController 报告的当前武器。
+            local curS = S.getCurrentWeapon and S.getCurrentWeapon()
+            local heldS = curS ~= nil and tostring(curS.Name) == tostring(wn)
+            if heldS and n <= 0 then
+                card.BackgroundColor3 = Color3.fromRGB(74, 30, 30)
+                S.skinPaintErr = string.format(
+                    "%s 没有可替换的材质部件（需同名 MeshPart + 现成 SurfaceAppearance，"
+                    .. "SA 不能是引擎烘焙的 TexturePackContent）", tostring(wn))
+            else
+                card.BackgroundColor3 = Color3.fromRGB(35, 62, 45)
+                S.skinPaintErr = nil
+                if not heldS then
+                    S.lastSkinPaint = string.format("%s -> %s（已记录，切枪后生效）", wn, skin)
+                end
+            end
+        end)
+    end
+
+    return true, string.format("%s：%d 款（%dx%d，2 列可滚动）", wn, #list, W, H)
+end
+
+-- ═══ 填充皮肤槽位：按品质从高到低，武器没皮肤时改用手套 ═══
+S.RARITY_ORDER = { Red = 1, Pink = 2, Purple = 3, Blue = 4, Stock = 9 }
+
+S.refreshSkinList = function(force)
+    local lib = S.getSkinsLib()
+    if not lib then return false, "皮肤库不可用" end
+    local RS2 = game:GetService("ReplicatedStorage")
+
+    -- 扫出所有有皮肤的武器（默认只扫一次并缓存）
+    -- ⚠ force = true 时必须真的重扫：以前「手动刷新」按钮调的是无参版本，
+    -- 缓存已经在 → 直接跳过扫描 → 首次扫描时没就绪的武器永远补不回来，只能重载。
+    local names = S.SKIN_WEAPONS_CACHE
+    if force == true then names = nil end
+    if not names then
+        names = {}
+        local wf = RS2:FindFirstChild("Database") and RS2.Database:FindFirstChild("Custom")
+            and RS2.Database.Custom:FindFirstChild("Weapons")
+        if wf then
+            for _, c in ipairs(wf:GetChildren()) do
+                local ok, l = pcall(lib.GetAllSkinsForWeapon, c.Name)
+                if ok and type(l) == "table" and #l > 0 then names[#names + 1] = c.Name end
+            end
+        end
+        -- ⚠ 只留「枪械 + 近战 + 手套」。
+        -- 数据库里有皮肤的还包括 C4 / Decoy Grenade / Flashbang / Smoke …，
+        -- 这些是 Part/特殊网格，没有 SurfaceAppearance 结构，列出来点了也没反应。
+        -- WEAPON_CLASS 里没有它们的条目（归为 nil），手套也不在表里，所以单独放行名字含 Glove 的。
+        local keep, dropped = {}, {}
+        for _, n in ipairs(names) do
+            local cls = WEAPON_CLASS and WEAPON_CLASS[n]
+            local ln = tostring(n):lower()
+            -- 手套有好几个名字：CT Glove / Driver Gloves / Hand Wraps / Sport Gloves …
+            local isGlove = ln:find("glove") ~= nil or ln:find("wrap") ~= nil
+            if cls ~= nil or isGlove then
+                keep[#keep + 1] = n
+            else
+                dropped[#dropped + 1] = tostring(n)
+            end
+        end
+        names = keep
+        S.skinDropped = dropped
+        table.sort(names)
+        S.SKIN_WEAPONS_CACHE = names
+    end
+
+    -- 按武器类别分组排序（步枪 → 冲锋 → 狙击 → 霰弹 → 手枪 → 近战 → 其它），
+    -- 同类里按名字。之前纯字母序，49 把混在一起很难找。
+    do
+        local ORD = { Rifle = 1, SMG = 2, Sniper = 3, Shotgun = 4, Pistol = 5, Melee = 6 }
+        local cls = WEAPON_CLASS or {}
+        table.sort(names, function(a, b)
+            local ca = cls[a] or "Other"
+            local cb = cls[b] or "Other"
+            local oa = ORD[ca] or 9
+            local ob = ORD[cb] or 9
+            if oa ~= ob then return oa < ob end
+            return tostring(a) < tostring(b)
+        end)
+    end
+
+    -- 槽位：有武器就显示中文名，没有就整行隐藏（以前写 "—" 占位，49 个槽位里空的一直挂在那）
+    local shown = 0
+    for i = 1, 52 do
+        local btn = S.UI["SkinSlot" .. i]
+        local wn = names[i]
+        if btn then
+            local frame = btn.ElementFrame
+            if wn then
+                -- 分组前缀：刀 / 手套 单独标出来，视觉上和枪分开。
+                -- ⚠ 不能真的合并成一项 —— 每把刀在 Database.Custom.Weapons 里是独立武器，
+                -- 皮肤池也各不一样（Karambit 和 Butterfly Knife 的皮肤列表完全不同），
+                -- 合并后就没有"选哪种刀"的入口了。
+                local cls = WEAPON_CLASS and WEAPON_CLASS[wn]
+                local ln = tostring(wn):lower()
+                local cn = (S.weaponCN and S.weaponCN(wn)) or wn
+                if cls == "Melee" then
+                    cn = "[刀] " .. cn
+                elseif ln:find("glove") or ln:find("wrap") then
+                    cn = "[手套] " .. cn
+                end
+                pcall(function() btn:SetTitle(cn) end)
+                S.skinSlotCB[i] = function()
+                    S._pendingWeapon = wn
+                    S.openSkinPanel()
+                end
+                if frame then pcall(function() frame.Visible = true end) end
+                shown = shown + 1
+            else
+                pcall(function() btn:SetTitle("—") end)
+                S.skinSlotCB[i] = nil
+                if frame then pcall(function() frame.Visible = false end) end
+            end
+        end
+    end
+    S.skinListTarget = names[1]
+    return true, string.format("可美化武器 %d 把（已显示 %d 个槽位），点名字开图鉴", #names, shown)
+end
+
+-- ═══ 武器名中文映射 ═══
+-- 之前槽位直接显示数据库里的英文名（Glock-18 / T Knife / SSG 08 …）。
+-- 常见 CS 武器手写一份，没列到的回落到游戏 LocalizationService，最后才用英文原名。
+S.WEAPON_CN = {
+    -- 手枪
+    ["Glock-18"] = "格洛克-18", ["USP-S"] = "USP 消音", ["P2000"] = "P2000",
+    ["P250"] = "P250", ["Five-SeveN"] = "FN 57", ["Tec-9"] = "Tec-9",
+    ["Dual Berettas"] = "双持贝瑞塔", ["Desert Eagle"] = "沙漠之鹰", ["R8 Revolver"] = "R8 左轮",
+    ["CZ75-Auto"] = "CZ75", ["P90"] = "P90",
+    -- 冲锋枪
+    ["MP9"] = "MP9", ["MAC-10"] = "MAC-10", ["MP7"] = "MP7", ["MP5-SD"] = "MP5",
+    ["PP-Bizon"] = "野牛", ["UMP-45"] = "UMP-45",
+    -- 步枪
+    ["AK-47"] = "AK-47", ["M4A4"] = "M4A4", ["M4A1-S"] = "M4A1 消音",
+    ["Galil AR"] = "加利尔", ["FAMAS"] = "法玛斯", ["AUG"] = "AUG", ["SG 553"] = "SG 553",
+    ["SCAR-20"] = "SCAR-20", ["G3SG1"] = "G3SG1",
+    -- 狙击
+    ["AWP"] = "AWP", ["SSG 08"] = "SSG 08",
+    -- 霰弹
+    ["Nova"] = "新星", ["XM1014"] = "XM1014", ["MAG-7"] = "MAG-7", ["Sawed-Off"] = "截短霰弹",
+    -- 机枪
+    ["Negev"] = "内格夫", ["M249"] = "M249",
+    -- 近战
+    ["T Knife"] = "T 方刀", ["CT Knife"] = "CT 刀", ["Karambit"] = "爪子刀",
+    ["M9 Bayonet"] = "M9 刺刀", ["Butterfly Knife"] = "蝴蝶刀", ["Flip Knife"] = "折刀",
+    ["Gut Knife"] = "穿肠刀", ["Skeleton Knife"] = "骷髅刀", ["Stiletto Knife"] = "短剑",
+    ["Bowie Knife"] = "鲍伊刀", ["Huntsman Knife"] = "猎杀者刀", ["Bayonet"] = "刺刀",
+    ["Falchion Knife"] = "弯刀", ["Shadow Daggers"] = "暗影双匕", ["LightSaber"] = "光剑",
+    -- 其它
+    ["Zeus x27"] = "宙斯 x27", ["C4"] = "C4", ["Gloves"] = "手套",
+    -- 手套（数据库里是六个独立名字，之前没翻译，列表里全是英文）
+    ["CT Glove"] = "CT 手套", ["T Glove"] = "T 手套",
+    ["Driver Gloves"] = "驾驶手套", ["Hand Wraps"] = "裹布",
+    ["Operator Gloves"] = "特工手套", ["Sports Gloves"] = "运动手套",
+    ["Specialist Gloves"] = "专家手套", ["Moto Gloves"] = "摩托手套",
+    ["HE Grenade"] = "高爆手雷", ["Flashbang"] = "闪光弹", ["Smoke Grenade"] = "烟雾弹",
+    ["Molotov"] = "燃烧瓶", ["Incendiary Grenade"] = "燃烧弹", ["Decoy Grenade"] = "诱饵弹",
+}
+
+S.weaponCN = function(n)
+    local s = tostring(n or "")
+    local c = S.WEAPON_CN and S.WEAPON_CN[s]
+    if c then return c end
+    if S.translator then
+        local ok, t = pcall(function() return S.translator:Translate(game, s) end)
+        if ok and type(t) == "string" and t ~= "" and t ~= s then return t end
+    end
+    return s
+end
+
+-- ═══ 皮肤名中文映射 ═══
+-- 游戏自带 LocalizationService 翻译（实测 zh-cn）：PinPoint→精确瞄准点、Canvas→画布、
+-- Fade→渐变，但 Stock→库存（错，应为原版）、Aurora 不翻译。
+-- 所以常用皮肤用手写映射，剩下的交给游戏翻译器兜底。
+S.SKIN_CN = {
+  ["Stock"] = "原版", ["PinPoint"] = "精确瞄点", ["Aurora"] = "极光", ["Canvas"] = "画布",
+  ["Fade"] = "渐变", ["Midas"] = "点金手", ["Racer8"] = "竞速八号", ["Experimental"] = "实验体",
+  ["Fuji"] = "富士", ["Revenant"] = "亡魂", ["Yurei"] = "幽霊", ["Broken Tv"] = "坏电视",
+  ["Hero of Hell"] = "地狱英雄", ["Aniki"] = "大哥", ["NoMercy"] = "不留情", ["Entombed"] = "埋葬",
+  ["Control"] = "控制", ["Icecap"] = "冰盖", ["X-Ray"] = "X 光", ["Lore"] = "传说",
+  ["Freedom"] = "自由", ["High Octane"] = "高辛烷", ["Sakura"] = "樱花", ["Akiro"] = "昭夫",
+  ["Rebellion"] = "叛逆", ["Red Baron"] = "红男爵", ["Sovapid"] = "苏维皮德",
+  ["Printstream"] = "印刷流", ["Hyper Beast"] = "野兽", ["Neo-Noir"] = "新黑色",
+  ["Asiimov"] = "亚西莫夫", ["Dragon Lore"] = "巨龙传说", ["Wild Lotus"] = "野荷",
+  ["Crimson Web"] = "深红之网", ["Doppler"] = "多普勒", ["Marble Fade"] = "大理石渐变",
+  ["Tiger Tooth"] = "虎牙", ["Ultraviolet"] = "紫外线", ["Night"] = "夜色",
+  ["Blue Steel"] = "蓝钢", ["Case Hardened"] = "表面淬火", ["Slaughter"] = "屠夫",
+  ["Vulcan"] = "火神", ["Bloodsport"] = "血猎", ["Orion"] = "猎户座",
+  ["Fire Serpent"] = "火蛇", ["Water Elemental"] = "水元素",
+}
+
+S.skinCN = function(name)
+  local n = tostring(name)
+  if S.SKIN_CN[n] then return S.SKIN_CN[n] end
+  if not S.translator then
+    local okT, tr = pcall(function()
+      return game:GetService("LocalizationService"):GetTranslatorForPlayerAsync(game.Players.LocalPlayer)
+    end)
+    if okT then S.translator = tr end
+  end
+  if S.translator then
+    local ok, t = pcall(function() return S.translator:Translate(game, n) end)
+    if ok and type(t) == "string" and t ~= "" and t ~= n then return t end
+  end
+  return n
+end
+
+-- ═══ 换枪自动刷新皮肤列表 ═══
+task.spawn(function()
+    local last
+    while true do
+        task.wait(0.5)
+        if S._alive == false or (REG and REG.gen ~= MY_GEN) then break end
+        pcall(function()
+            local ic = getInvCtrl()
+            if not ic then return end
+            local w = ic.peekCurrentEquippedForMovement()
+            local n = w and tostring(w.Name) or "none"
+            if n ~= last then
+                last = n
+                if S.refreshSkinList then S.refreshSkinList() end
+            end
+        end)
+    end
+end)
+
+-- ═══ 皮肤图鉴 v2：先选武器 → 出图片网格（每张带中文名 + 品质）═══
+-- 为什么做成「武器行 + 图片网格」：用户要求点武器名后直接出图，且图上要标名字和品质。
+-- 图片来自 Skins.GetWearImageForFloat(item, 0.01)，中文名走 S.skinCN（手写映射 + 游戏翻译兜底）。
+S.SKIN_WEAPONS_CACHE = nil
+
 getgenv().MV_V2 = {
     cfg = cfg, state = S, collect = collect, aimTarget = aimTarget, buy = buy,
     window = Window, allCharModels = allCharModels, culledCount = culledCount,
@@ -11127,6 +15333,13 @@ getgenv().MV_V2 = {
     -- 调试用：ESP 对象池和绘制计数
     espObjects = function() return S.espObjects end,
     espTicks = function() return espTick end,
+    -- 调试用：反弹点黄方块池。
+    -- 「收起/扔出投掷物后黄方块还挂在屏幕上」这个 bug 的验证入口：
+    --   bounceDraw({Vector3, Vector3})  → 强制画两个方块
+    --   bounceDump()                    → 返回 (池, 当前显示数)
+    -- 手里不是投掷物时，updateThrow 每帧会走早退分支，池里所有方块应当被隐藏、计数归零。
+    bounceDraw = function(pts) return S.drawBounceRings(pts) end,
+    bounceDump = function() return S.bounceRings, S.bounceRingCount end,
     w2s = function(p) return w2s(p) end,
     updateEsp = function() updateEsp() end,
     setInfiniteAmmo = function(on) return setInfiniteAmmo(on) end,
@@ -11135,9 +15348,85 @@ getgenv().MV_V2 = {
     applySkipFireDelay = function() return applySkipFireDelay() end,
     setInstantReload = function(on) return setInstantReload(on) end,
     applyInstantReload = function() return applyInstantReload() end,
+
+    -- ═══ 现场诊断（左键不开枪 / 切不了枪 / 菜单关不掉鼠标 一类问题）═══
+    -- 用法：print(getgenv().MV_V2.diag())
+    -- 或者逐项：MV_V2.peekDiag() / MV_V2.inputDiag() / MV_V2.skinPoll()
+    peekDiag = function()
+        local d = getgenv().MV_PEEK_DIAG
+        if not d then return "no diag（开头补丁没执行？）" end
+        return string.format("hit=%d miss=%d noAttr=%d badJson=%d last=%s",
+            d.hit, d.miss, d.noAttr, d.badJson, tostring(d.last))
+    end,
+
+    -- 判定「peek 到底返回了什么」：nil / 真实 item（带方法）/ 非法 JSON 表
+    equipDiag = function()
+        local ic = getInvCtrl()
+        if not ic then return "no InventoryController" end
+        local ok, w = pcall(function() return ic.peekCurrentEquippedForMovement() end)
+        if not ok then return "peek 抛错: " .. tostring(w) end
+        if w == nil then return "nil（手上没有东西，这是合法状态）" end
+        if type(w) ~= "table" then return "非表: " .. type(w) end
+        local methods = {}
+        for _, k in ipairs({ "shoot", "equip", "unequip", "reload", "drop", "scope" }) do
+            if type(w[k]) == "function" then methods[#methods + 1] = k end
+        end
+        if #methods == 0 then
+            return string.format("⚠ 非法对象：Name=%s 但没有任何武器方法（这就是「左键不开枪」的根因）",
+                tostring(w.Name))
+        end
+        return string.format("✅ 真实 item：%s | 方法=%s", tostring(w.Name), table.concat(methods, ","))
+    end,
+
+    -- 鼠标/输入：菜单 ScreenGui 有没有在吃鼠标、游戏能不能收到按键
+    inputDiag = function()
+        local UIS = game:GetService("UserInputService")
+        local lp = game.Players.LocalPlayer
+        local lines = {}
+        local sg = S.menuScreenGui
+        lines[#lines + 1] = "menuScreenGui=" .. (sg and (tostring(sg.Enabled) .. " / " .. tostring(sg.DisplayOrder)) or "not-found")
+        lines[#lines + 1] = string.format("m1down=%s m2down=%s",
+            tostring(UIS:IsMouseButtonPressed(Enum.UserInputType.MouseButton1)),
+            tostring(UIS:IsMouseButtonPressed(Enum.UserInputType.MouseButton2)))
+        -- 光标下有什么 GUI（我们自己 DisplayOrder 最大值，最容易挡住商店/背包）
+        local okPos, pos = pcall(function() return UIS:GetMouseLocation() end)
+        if okPos and pos then
+            local hits = {}
+            local pg = lp:FindFirstChild("PlayerGui")
+            if pg then
+                pcall(function()
+                    for _, g in ipairs(pg:GetGuiObjectsAtPosition(pos.X, pos.Y)) do
+                        if #hits < 5 then hits[#hits + 1] = g:GetFullName() end
+                    end
+                end)
+            end
+            lines[#lines + 1] = "cursor=(" .. math.floor(pos.X) .. "," .. math.floor(pos.Y) .. ") under="
+                .. ((#hits > 0) and table.concat(hits, " | ") or "none")
+        end
+        local hp = getgenv().MV_PEEK_DIAG
+        if hp then
+            lines[#lines + 1] = string.format("peek: hit=%d miss=%d noAttr=%d badJson=%d last=%s",
+                hp.hit, hp.miss, hp.noAttr, hp.badJson, tostring(hp.last))
+        end
+        return table.concat(lines, "\n")
+    end,
+
+    -- 换肤轮询的真实开销（判断 0.12 秒循环是不是卡顿尖峰）
+    skinPoll = function() return S.skinPoll.report() end,
+
+    -- 一键重打三处补丁（现场发现 patch=true 但功能不对时用）
+    reapply = function()
+        local ok1, m1 = pcall(S.patchGetCurrentEquipped)
+        local ok2, m2 = pcall(S.patchRaycast)
+        local ok3 = pcall(S.installSkinHook)
+        return string.format("gce=%s(%s) raycast=%s(%s) skinHook=%s",
+            tostring(ok1 and m1), tostring(m1),
+            tostring(ok2 and m2), tostring(m2), tostring(ok3))
+    end,
 }
 
 Window:Notify({ Title = "MovementV2 菜单", Description = "已加载 · 右键 Ctrl 开关菜单", Lifetime = 4 })
+
 -- ⚠ 这里全部用 warn 而不是 print。
 -- 手机端执行器的控制台默认只显示 warn / error，print 是不显示的 ——
 -- 之前写成 print，用户看到的是一片红色报错里没有一段中文说明，
@@ -11164,4 +15453,314 @@ warn("════════════════════════�
 warn("[v2] loaded | hook ok | esp=" .. tostring(cfg.esp))
 warn("────────────── 报错已结束，不要再往下截了 ──────────────")
 
+-- ═══ 独立 FOV 圈 ═══
+-- 为什么不用脚本内部的 updateFov：它的可见性判断出过问题（要求 silentAim AND showFov，
+-- 关掉静默瞄准连圈一起消失），而且整条路径都在 guard 里被 pcall 包着，出错是静默的。
+-- 这里用一条独立的 Drawing.Circle + 0.1 秒轮询，只受 showFov / fullSphere / fov / fovColor 控制。
+if Drawing and Drawing.new then
+    (function()
+        local circle = Drawing.new("Circle")
+        circle.Thickness = 1
+        circle.Filled = false
+        circle.NumSides = 64
+        circle.Transparency = 0.5
+        circle.Visible = false
+        S.fovCircleObj = circle
+        S._fovStop = false
+        task.spawn(function()
+            -- ⚠ 三个退出条件缺一不可：
+            --   · _fovStop：显式停止（fullCleanup 现在会置 true）
+            --   · fovCircleObj 被换掉：说明本实例已经被新实例取代
+            --   · _alive == false：卸载
+            -- 原来只有前两个，而清理路径从来没把 _fovStop 置 true、也没换掉 fovCircleObj ——
+            -- 只要 Destroy 之后那次 circle.Visible 赋值没抛错，这个循环就会一直以 10Hz 空转。
+            while not S._fovStop and S.fovCircleObj == circle and S._alive ~= false do
+    local hideBySphere = (cfg.fullSphere == true) and ((cfg.aimMode or "smooth") == "silent")
+    if hideBySphere or not cfg.showFov then
+                    circle.Visible = false
+                else
+                    local cam2 = workspace.CurrentCamera
+                    local vp2 = cam2 and cam2.ViewportSize or Vector2.new(1920, 1080)
+                    local diag2 = math.sqrt(vp2.X * vp2.X + vp2.Y * vp2.Y)
+                    circle.Position = Vector2.new(vp2.X / 2, vp2.Y / 2)
+                    circle.Radius = math.clamp(tonumber(cfg.fov) or 300, 5, diag2 * 0.5)
+                    circle.Color = cfg.fovColor or Color3.fromRGB(255, 255, 255)
+                    circle.Thickness = 1
+                    circle.Transparency = 0.5
+                    circle.Visible = true
+                end
+                task.wait(0.1)
+            end
+            pcall(function() circle:Remove() end)
+        end)
+    end)()
+end
+
+-- ═══ 反作弊拦截（必须尽早执行，赶在游戏首次调用之前）═══
+-- 这两处覆盖之前从未被调用过 → 游戏的 getfenv 检测一直能触发 → u0/u115 被清空，
+-- 表现是「商店买了不进包、捡东西消失、切不出枪、手上空气」。
+-- ⚠ 必须用 `do (function() ... end)() end` 而不是 `do ... end`：
+--   主 chunk 的 local 槽位已经贴 200 上限，`do ... end` 里的 local 一样占槽位，
+--   这里 4 个（ok1/msg1/ok2/msg2）正好是压垮编译的那一根
+--   （实测报错：Out of local registers when trying to allocate ok1: exceeded limit 200）。
+--   IIFE 把作用域真正隔开，槽位立即释放。
+do (function()
+    local ok1, msg1 = pcall(function() return S.patchGetCurrentEquipped() end)
+    warn("[ac] getCurrentEquipped patch = " .. tostring(ok1) .. " " .. tostring(msg1))
+    local ok2, msg2 = pcall(function() return S.patchRaycast() end)
+    warn("[ac] Raycast patch = " .. tostring(ok2) .. " " .. tostring(msg2))
+end)() end
+
+-- ═══ 换刀外观：MeshId 变形（实测唯一不崩的路）═══
+--
+-- 为什么不用 hook GetCameraModel：游戏切枪根本不重建 viewmodel，
+-- 只是把模型在 Camera 和 ViewmodelStash 之间搬（实测 skinHookCalls 恒为 nil）。
+--
+-- 为什么不用往 stash 塞新模型：新模型自带 Motor6D，关节 Part0/Part1 指向它自己那份部件，
+-- 挂到相机时和当前骨架对不上 → 引擎渲染阶段直接崩（实测把整个客户端崩掉）。
+--
+-- 正确做法：保留原模型对象和骨架，只把 MeshPart 的几何换成目标刀的。
+--   · MeshPart.MeshId 是只读的（直接赋值 pcall 返回 false）
+--   · 必须走 MeshPart:ApplyMesh(源部件)
+--   · ApplyMesh **不会改 Size** —— 所以 Motor6D 的 C0/C1 完全不受影响，不会错位/崩
+-- 实测（T Knife → Butterfly Knife）四个部件全部 ApplyMesh 成功，截图确认外观变成折刀。
+do (function()
+    -- 近战图标（实测从 Database.Custom.Weapons.<名字>.Icon 抓的全表）
+    S.MELEE_ICONS = S.MELEE_ICONS or {
+        ["T Knife"]         = "rbxassetid://140484419446969",
+        ["CT Knife"]        = "rbxassetid://115204080823353",
+        ["Butterfly Knife"] = "rbxassetid://78088217065173",
+        ["Karambit"]        = "rbxassetid://85121618781867",
+        ["M9 Bayonet"]      = "rbxassetid://92481124554479",
+        ["Flip Knife"]      = "rbxassetid://103569239379116",
+        ["Gut Knife"]       = "rbxassetid://91965772008164",
+        ["Skeleton Knife"]  = "rbxassetid://73573766861663",
+        ["Stiletto Knife"]  = "rbxassetid://71208637985987",
+        ["LightSaber"]      = "rbxassetid://126330826978789",
+    }
+
+    -- 按名字从背包里找 weapon 表 —— 它就是 construct 的 a3（WeaponComponent）
+    S.findWeaponByName = function(name)
+        local ic = getInvCtrl()
+        if not ic then return nil end
+        local ok, inv = pcall(function() return ic.getCurrentInventory() end)
+        if not ok or type(inv) ~= "table" then return nil end
+        for _, item in pairs(inv) do
+            local items = type(item) == "table" and (item._items or item) or nil
+            if type(items) == "table" then
+                for _, it in ipairs(items) do
+                    if type(it) == "table" and tostring(it.Name) == tostring(name) then return it end
+                end
+            end
+        end
+        return nil
+    end
+
+    S.applyMeleeSwap = function(wn)
+        if cfg.meleeSwapOn == false then return 0 end
+        local to = S.meleeSwap and S.meleeSwap[tostring(wn)]
+        if not to or to == "" or tostring(to) == tostring(wn) then return 0 end
+
+        local weapon = S.findWeaponByName(tostring(wn))
+        if not weapon then return 0 end
+        local vm = weapon.Viewmodel
+        if type(vm) ~= "table" or type(vm.construct) ~= "function" then return 0 end
+
+        local character = (workspace:FindFirstChild("Characters") and workspace.Characters:FindFirstChild(LP.Name))
+            or LP.Character
+        if not character then return 0 end
+
+        -- 清掉 cam 下同名残留，否则两个同名模型会互相打架
+        local cam = workspace.CurrentCamera
+        if cam then
+            for _, c in ipairs(cam:GetChildren()) do
+                if c:IsA("Model") and c.Name == tostring(wn) and c ~= vm.Model then
+                    pcall(function() c:Destroy() end)
+                end
+            end
+        end
+
+        -- 皮肤：换刀后必须用**目标刀自己**的皮肤表（T Knife 只有 Stock；
+        -- 蝴蝶刀 36 个、Karambit 38 个、M9 Bayonet 34 个…）。
+        -- 用户在皮肤面板选的目标刀皮肤存在 S.skinPaint[目标刀名] 里，没选就回落 Stock。
+        local wantSkin = "Stock"
+        if S.skinPaint then
+            local picked = S.skinPaint[tostring(to)]
+            if picked and picked ~= "" then wantSkin = tostring(picked) end
+        end
+        -- 武器名或皮肤任一变化都要重建（只比武器名的话，换皮不生效）
+        if tostring(vm.CameraModelWeapon) == tostring(to) and tostring(vm.Skin) == wantSkin then return 0 end
+
+        vm.CameraModelWeapon = tostring(to)
+        vm.Skin = wantSkin
+        vm.Float = 0.001
+
+        -- ★ 关键：a2 = 角色模型，a3 = WeaponComponent。
+        --   漏掉 a3 会在 Viewmodel:957 的 `local Properties = v3.Properties` 报 nil，
+        --   construct 后半段（材质/手套/挂载）全部中断，手上就是两根黑柱。
+        --   而且 construct 内部自己会 Model:Destroy() 重建，所以不要先调 destroy()。
+        local ok = pcall(function() vm:construct(character, weapon) end)
+        if not ok or typeof(vm.Model) ~= "Instance" then return 0 end
+
+        -- 模型名必须改回当前武器名，游戏就是按这个名字找 viewmodel 的
+        pcall(function() vm.Model.Name = tostring(wn) end)
+
+        -- ★ 声音：construct 会把 Animation 换成目标刀的（实测 Animation="Flip Knife"），
+        --   但 Sound 不会跟着换 —— 它仍然指向原武器的声音组
+        --   （实测 SoundGroupName="CT Knife"、Sounds=Folder "CT Knife"）。
+        --   结果就是「检视/挥刀/切刀放的都是原刀的音效」，甚至被当成没声音。
+        --   Assets 的 Sounds 根目录下有全部 64 个声音组，按目标刀名取即可。
+        do
+            local an = vm.Animation
+            local snd = an and an.Sound
+            if snd and typeof(snd.Sounds) == "Instance" then
+                local root = snd.Sounds.Parent
+                local tf = root and root:FindFirstChild(tostring(to))
+                if tf then
+                    snd.Sounds = tf
+                    snd.SoundGroupName = tostring(to)
+                end
+            end
+        end
+
+        S.meleeSwapped = (S.meleeSwapped or 0) + 1
+        return 1
+    end
+
+    -- 物品栏同步：换刀后槽位 3 的图标/名字还是原武器，游戏每次刷新又会改回去，所以盯着纠正
+    S.syncMeleeIcon = function(wn)
+        local to = S.meleeSwap and S.meleeSwap[tostring(wn)]
+        if not to then return 0 end
+        local pg = LP:FindFirstChild("PlayerGui")
+        local inv = pg and pg.MainGui and pg.MainGui.Gameplay
+            and pg.MainGui.Gameplay.Bottom and pg.MainGui.Gameplay.Bottom:FindFirstChild("Inventory")
+        local melee = inv and inv:FindFirstChild("Melee")
+        local weaponFrame = melee and melee:FindFirstChild("Weapon")
+        if not weaponFrame then return 0 end
+        local n = 0
+        local nl = weaponFrame:FindFirstChild("WeaponName")
+        if nl and nl.Text ~= tostring(to) then
+            nl.Text = tostring(to)
+            n = n + 1
+        end
+        local il = weaponFrame:FindFirstChild("Melee")
+        local icon = S.MELEE_ICONS[tostring(to)]
+        if il and icon and il.Image ~= icon then
+            il.Image = icon
+            n = n + 1
+        end
+        return n
+    end
+
+    -- ★ 按动画变体名补齐声音组。
+    --
+    -- 蝴蝶刀的检视有 Inspect / Inspect2 两个变体（VariantGroups.Inspect 长度 2，
+    -- Animations 里是 Inspect 和 Inspect2），游戏会随机挑一个播；
+    -- 但 Sounds 组里只配了 Inspect —— 抽到 Inspect2 那一次就整段静音。
+    -- 这里对所有刀补 Inspect2~6：从同名基克隆（必须保留子节点，否则
+    -- Viewmodel.Classes.Animation 的 `#folder:GetChildren() > 0` 判定过不去）。
+    S.patchVariantSounds = function()
+        local root = RS:FindFirstChild("Sounds")
+        if not root then return 0 end
+        local n = 0
+        for _, grp in ipairs(root:GetChildren()) do
+            if grp:IsA("Folder") then
+                local src = grp:FindFirstChild("Inspect") or grp:FindFirstChild("SecondInspect")
+                if src and #src:GetChildren() > 0 then
+                    for i = 2, 6 do
+                        local vname = "Inspect" .. i
+                        if not grp:FindFirstChild(vname) then
+                            local c = src:Clone()
+                            c.Name = vname
+                            c.Parent = grp
+                            n = n + 1
+                        end
+                    end
+                end
+            end
+        end
+        S.variantSoundsPatched = n
+        return n
+    end
+
+    -- 声音组跟随目标刀（兜底）：construct 只在重建那一次会补 Sound，
+    -- 但游戏自己切枪/重载也会把 Sound 重置回原武器，所以每轮都检查一遍。
+    S.syncSound = function(wn)
+        local to = S.meleeSwap and S.meleeSwap[tostring(wn)]
+        if not to then return 0 end
+        local weapon = S.findWeaponByName and S.findWeaponByName(tostring(wn))
+        if not weapon then return 0 end
+        local vm = weapon.Viewmodel
+        local snd = vm and vm.Animation and vm.Animation.Sound
+        if not (snd and typeof(snd.Sounds) == "Instance") then return 0 end
+        local root = snd.Sounds.Parent
+        local tf = root and root:FindFirstChild(tostring(to))
+        if not tf then return 0 end
+        if tostring(snd.SoundGroupName) == tostring(to) and snd.Sounds == tf then return 0 end
+        snd.Sounds = tf
+        snd.SoundGroupName = tostring(to)
+        return 1
+    end
+
+    -- ★ 检视前段静音补播。
+    --
+    -- 检视动画的前几段在资源里没有声音标记，游戏代码只在 marker 上才调 Sound:play，
+    -- 所以那一段补文件夹也不会响。改成盯 IsInspecting 从 false 翻 true 的瞬间，
+    -- 手动播一次 Inspect（实测 Sound:play({Name=..., Parent=PlayerGui}) 有效）。
+    S.installInspectSound = function()
+        if S._inspectSndConn then return end
+        local was = false
+        S._inspectSndConn = RunService.Heartbeat:Connect(function()
+            local okW, w = pcall(function()
+                local ic = getInvCtrl()
+                return ic and ic.peekCurrentEquippedForMovement()
+            end)
+            local inspecting = (okW and type(w) == "table" and w.IsInspecting == true)
+            if inspecting and not was then
+                local weapon = S.findWeaponByName and S.findWeaponByName(tostring(w.Name))
+                local vm = weapon and weapon.Viewmodel
+                local snd = vm and vm.Animation and vm.Animation.Sound
+                if snd then
+                    local pg = LP:FindFirstChild("PlayerGui")
+                    pcall(function() snd:play({ Name = "Inspect", Parent = pg }) end)
+                    S.inspectSndPlayed = (S.inspectSndPlayed or 0) + 1
+                end
+            end
+            was = inspecting
+        end)
+        S.conns[#S.conns + 1] = S._inspectSndConn
+    end
+
+    -- 0.25 秒节流轮询：先换模型，再同步物品栏图标（游戏会重刷，所以两件都盯着）
+    local lastAt = 0
+    local conn = RunService.Heartbeat:Connect(function()
+        if S._alive == false then return end
+        local now = os.clock()
+        if now - lastAt < 0.25 then return end
+        lastAt = now
+        local ok, w = pcall(function()
+            local ic = getInvCtrl()
+            return ic and ic.peekCurrentEquippedForMovement()
+        end)
+        if not (ok and w and w.Name) then return end
+        local name = tostring(w.Name)
+        pcall(S.applyMeleeSwap, name)
+        pcall(S.syncMeleeIcon, name)
+        pcall(S.syncSound, name)
+    end)
+    S.conns[#S.conns + 1] = conn
+end)() end
+
+S.installSkinHook()
+-- 声音：补齐检视变体（Inspect2~6），并挂上「检视开始补播」的钩子
+pcall(S.patchVariantSounds)
+pcall(S.installInspectSound)
+-- ★ 平滑自瞄：加载时就装 hook（installSmooth 是幂等的）。
+--   原来只在 GUI toggle 的 Callback 里调（L12777），所以「注入脚本后自瞄完全没用」——
+--   必须手动去 GUI 点一下开关才会接管 GetMagnetismRotation。
+--   现在加载即装；cfg.smoothAimHijack 默认 true，开箱就用；不想用去 GUI 关掉即可。
+pcall(function() return AASYS.installSmooth() end)
+task.delay(3, function() pcall(S.refreshSkinList) end)
+warn("[skin] GetCameraModel hook=" .. tostring(S.skinHookInstalled))
+warn("[aim] smoothOK=" .. tostring(AASYS.smoothOK) .. " hijack=" .. tostring(cfg.smoothAimHijack) .. " mode=" .. tostring(cfg.aimMode) .. " fov=" .. tostring(cfg.fov))
 return "v2 loaded"
